@@ -1,0 +1,63 @@
+{
+  "name": "dsh-codebuddy-acp",
+  "version": "0.5.0",
+  "description": "把本机 CodeBuddy CLI（ACP 模式）接入 DeepSeek Harness：模型选择器里出现 CodeBuddy 分组，可选用 CodeBuddy 自带的模型，并复用腾讯提供的额度。",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "src",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "codebuddy",
+    "acp",
+    "llm-provider"
+  ],
+  "author": "EVA09",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/EVA09/dsh-codebuddy-acp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/EVA09/dsh-codebuddy-acp/issues"
+  },
+  "homepage": "https://github.com/EVA09/dsh-codebuddy-acp#readme",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "scripts": {
+    "test": "node test/billing.test.mjs && node test/rate-source.mjs && node test/reasoning-and-blocks.test.mjs && node test/tool-replay.test.mjs && node test/sync-title-plan-approval.test.mjs && node test/host-smoke.mjs && node test/client-smoke.mjs && node test/image-prompt.test.mjs && node test/host-integration.mjs && node test/cancel-and-recovery.test.mjs",
+    "test:models": "node test/run.mjs --models",
+    "test:live": "node test/run.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-ui-tool",
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  }
+}

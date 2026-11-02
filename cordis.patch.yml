@@ -1,0 +1,11 @@
+# dsh-codebuddy-acp bundle patch.
+#
+# 一行 insert 即挂载 Host 半身：它在 ctx.llm 上为 provider 路由 `codebuddy`
+# 注册一个适配器（模型选择器里出现 CodeBuddy 分组），并在 ctx.webServer 上
+# 挂载控制台接口 /api/codebuddy-console。
+#
+# 浏览器半身由 package.json 的 dsh.client 声明，客户端条目 id 就是包名。
+- insert:
+    - id: codebuddy-acp
+      name: 'dsh-codebuddy-acp'
+      config: {}

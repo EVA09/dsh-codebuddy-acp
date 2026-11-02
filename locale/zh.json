@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "CodeBuddy (ACP)",
+    "description": "把本机 CodeBuddy CLI 通过 ACP 协议接入为 DSH 的内部 agent，并提供侧栏控制台：账号剩余积分、每日积分领取、各模型积分倍率与模型启用排序。"
+  }
+}

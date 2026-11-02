@@ -1,0 +1,35 @@
+# 依赖与日志
+node_modules/
+*.log
+
+# 探针抓包产物：含账号标识（userId / 昵称）与本机绝对路径，不随仓库分发
+probe/out/*
+!probe/out/red-64x64.png
+!probe/out/blue-64x64.png
+probe/work/
+probe/asar/
+*.asar
+
+# 一次性逆向脚本：写死了本机路径，仅本地使用，不进公开仓库
+probe/asar-*.mjs
+probe/dump-v4.mjs
+probe/dump-assistant-v4.mjs
+
+# 原样搬运的官方文档 / CLI 帮助全文：版权归腾讯，仓库只保留链接与结论，不分发原文
+probe/acp-doc.html
+probe/acp-doc.txt
+probe/cli-help.txt
+probe/cli-acp-help.txt
+
+# 系统与编辑器
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+
+# 本地草稿
+*.local.yml
+.env
+.env.*

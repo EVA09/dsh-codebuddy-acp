@@ -1,0 +1,7 @@
+# 统一换行，避免 Windows 检出把 JS/MD 改成 CRLF 造成整文件 diff
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary
+*.svg text

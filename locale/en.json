@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "CodeBuddy (ACP)",
+    "description": "Bridges the local CodeBuddy CLI over ACP into DSH as an internal agent, with a sidebar console for remaining account credits, daily credit check-in, per-model credit rates, and model enable/order management."
+  }
+}
