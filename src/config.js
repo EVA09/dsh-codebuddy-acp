@@ -23,7 +23,7 @@ const PERMISSION_MODES = ['default', 'acceptEdits', 'bypassPermissions', 'plan',
 /** 工具调用播报方式：写进推理块（reasoning）或完全不播报。 */
 const NARRATION_MODES = ['reasoning', 'off']
 
-/** 重放完整历史时怎么处理图片（见 README 的 `replayImages`）。 */
+/** 重放完整历史时怎么处理图片（见 AGENT.md 的 `replayImages`）。 */
 const REPLAY_IMAGE_MODES = ['latest', 'all', 'none']
 
 /**
@@ -161,7 +161,7 @@ export const DEFAULT_CONFIG = Object.freeze({
    * 是否把 DSH 消息里的图片**真的发给 CodeBuddy**。
    *
    * 开启时图片作为 ACP `{type:'image',data,mimeType}` 内容块随 `session/prompt` 发出去
-   * （实测 CodeBuddy 会真的「看见」，见 README「图片」一节）；
+   * （实测 CodeBuddy 会真的「看见」，见 AGENT.md「图片」一节）；
    * 关闭时退回旧行为：正文里只留 `[图片 N：name]` 占位符。
    */
   imageInput: true,
