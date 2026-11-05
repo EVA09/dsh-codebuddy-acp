@@ -18,6 +18,7 @@ import assert from 'node:assert/strict'
 
 import { CodeBuddyAdapter, resolvePermissionRequest } from '../src/adapter.js'
 import { resolveConfig } from '../src/config.js'
+import { ToolCallBridge } from '../src/tool-bridge.js'
 
 // ---------------------------------------------------------------------------
 // 假 ACP 连接
@@ -237,6 +238,101 @@ async function waitFor(predicate, limit = 2000) {
     await new Promise((resolve) => setTimeout(resolve, 1))
   }
   assert.equal(chunks.at(-1)?.reason?.kind, 'aborted')
+  await adapter.dispose()
+}
+
+// ---------------------------------------------------------------------------
+// 场景 1b：分段模式（toolCut: 'step'）中途取消 —— 也要通知 agent、并且能接着下一轮
+// ---------------------------------------------------------------------------
+
+/**
+ * 分段模式下，一次 cut 之后 DSH 可能立刻中断（用户按 Esc）。此时 ACP 侧那一轮**还在跑**，
+ * 所以必须：
+ *
+ * 1. 给 agent 发 `session/cancel`（否则它继续烧额度，而且会话一直「忙」）；
+ * 2. 释放连接级闸门（否则之后每一轮都会卡在同一把锁上）；
+ * 3. 把这条 live turn 从会话态摘掉，下一轮能正常发新 prompt。
+ */
+{
+  const bridge = new ToolCallBridge()
+  bridge.ready = true
+  const listeners = new Map()
+  const calls = { prompts: [], cancel: 0, resolvePrompt: undefined }
+  const connection = {
+    calls,
+    closed: false,
+    authUrl: undefined,
+    get stderrTail() { return '' },
+    onUpdate(id, listener) {
+      listeners.set(id, listener)
+      return () => listeners.delete(id)
+    },
+    async newSession() { return sessionPayload('sess-stepped') },
+    async setSessionConfigOption() { return { configOptions: [] } },
+    prompt(id, content, options) {
+      calls.prompts.push(content.map((item) => item.text).join(''))
+      const emit = (frame) => listeners.get(id)?.(frame)
+      // 第一个工具立刻结算 → 本 step 收口（cut），但 ACP turn 还没结束。
+      emit({ sessionUpdate: 'tool_call', toolCallId: 'c1', title: 'Read a.txt', kind: 'read', status: 'in_progress' })
+      emit({ sessionUpdate: 'tool_call_update', toolCallId: 'c1', status: 'completed', rawOutput: { type: 'text', text: 'alpha' } })
+      return new Promise((resolve, reject) => {
+        calls.resolvePrompt = resolve
+        const signal = options?.signal
+        const onAbort = () => reject(Object.assign(new Error('session/prompt 已取消'), {
+          name: 'AcpError',
+          code: 'ABORTED',
+        }))
+        if (signal?.aborted === true) onAbort()
+        else signal?.addEventListener('abort', onAbort, { once: true })
+      })
+    },
+    cancel() {
+      calls.cancel += 1
+      calls.resolvePrompt?.({ stopReason: 'cancelled' })
+    },
+    async close() { this.closed = true },
+  }
+  const adapter = new CodeBuddyAdapter({
+    config: resolveConfig({}),
+    launch: { argv: [], env: {}, note: 'test' },
+    host: {
+      defaultDirectory: () => process.cwd(),
+      resolveCwd: async () => process.cwd(),
+      readTextFile: async () => '',
+      writeTextFile: async () => {},
+    },
+    logger: { info: () => {}, warn: () => {} },
+    policy: {},
+    toolBridge: bridge,
+  })
+  installShared(adapter, connection)
+
+  const controller = new AbortController()
+  const first = await collect(adapter, { signal: controller.signal })
+  const toolBlock = first.find((chunk) => chunk.type === 'block-end' && chunk.block.type === 'tool-call')
+  assert.ok(toolBlock !== undefined, '第 1 步必须发出工具块（cut）')
+  assert.equal(JSON.parse(toolBlock.block.arguments).status, 'completed', '发块时工具已结算')
+  assert.equal(first.find((chunk) => chunk.type === 'finish').reason.kind, 'tool-calls', 'cut 的步用 tool-calls 收口')
+
+  // 此刻 ACP turn 还在跑：中断它。
+  controller.abort()
+  const record = adapter.sessions.get('session-under-test')
+  assert.ok(record?.live !== undefined, 'cut 之后 live turn 仍然在跑')
+  assert.equal(calls.cancel, 1, '分段中途中断也必须向 agent 发一次 session/cancel')
+  await waitFor(() => record.live === undefined)
+  assert.equal(record.live, undefined, '中断后要把 live turn 从会话态摘掉（否则闸门与状态泄漏）')
+
+  // 下一轮必须能正常发新 prompt（闸门已释放、live 已清）。
+  const second = await collect(adapter, {
+    messages: [{ role: 'user', content: [{ type: 'text', text: '再来一次' }] }],
+  })
+  assert.equal(calls.prompts.length, 2, '中断后下一轮要能重新发 prompt')
+  assert.equal(
+    second.filter((chunk) => chunk.type === 'block-end' && chunk.block.type === 'tool-call').length,
+    1,
+    '新一轮仍然照常产出工具块（这条假连接每次 prompt 都会发一次工具调用）',
+  )
+  assert.equal(second.find((chunk) => chunk.type === 'finish').reason.kind, 'tool-calls', '新一轮的第一步同样是 cut')
   await adapter.dispose()
 }
 

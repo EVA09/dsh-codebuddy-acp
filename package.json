@@ -1,6 +1,6 @@
 {
   "name": "dsh-codebuddy-acp",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "把本机 CodeBuddy CLI（ACP 模式）接入 DeepSeek Harness：模型选择器里出现 CodeBuddy 分组，可选用 CodeBuddy 自带的模型，并复用腾讯提供的额度。",
   "type": "module",
   "main": "./index.js",
@@ -44,7 +44,8 @@
   "scripts": {
     "test": "node test/billing.test.mjs && node test/rate-source.mjs && node test/reasoning-and-blocks.test.mjs && node test/tool-replay.test.mjs && node test/sync-title-plan-approval.test.mjs && node test/host-smoke.mjs && node test/client-smoke.mjs && node test/image-prompt.test.mjs && node test/host-integration.mjs && node test/cancel-and-recovery.test.mjs",
     "test:models": "node test/run.mjs --models",
-    "test:live": "node test/run.mjs"
+    "test:live": "node test/run.mjs",
+    "test:live:steps": "node test/step-cut.live.mjs"
   },
   "dsh": {
     "bundle": {
@@ -61,3 +62,4 @@
     }
   }
 }
+

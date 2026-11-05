@@ -124,8 +124,35 @@ export const DEFAULT_CONFIG = Object.freeze({
    * - `start`：一看到调用就发。好处是工具在跑的几十秒里界面上有卡片在动，
    *   代价是这张卡片的完成态要等**整轮 ACP 结束**（DSH 只在模型流结束后才执行回放工具），
    *   期间一直显示「执行中」。
+   *
+   * 只在 `toolCut: 'turn'` 时有意义：`step` 模式必须等结算（否则卡片一出现就是未完成态）。
    */
   toolEmit: 'settle',
+  /**
+   * 一次 ACP turn 怎么切给 DSH 的 step。
+   *
+   * - `step`（默认）：**每个工具调用独占一个 step**。DSH 只在一步的模型流结束后才执行
+   *   这一步的 `tool-call` 块，所以「一轮 = 一步」会让整轮的工具卡片都挂到轮末才一起结算。
+   *   切成多步之后，工具一结算就在自己那一步里落地、当场变成完成态，助手正文也留在它
+   *   真正出现的那个位置。step 之间不发任何 ACP 请求，不会多花额度。
+   * - `turn`：一轮一个 step（旧行为）。工具卡片要等整轮 ACP 跑完才结算。
+   */
+  toolCut: 'step',
+  /**
+   * `toolCut: 'step'` 下，回放工具最多等多久来判断「这条 ACP turn 还有没有后续内容」。
+   *
+   * 等得到后续内容就继续下一个 step；等不到（已经收口且没有剩余帧）就 `concludeTurn()`
+   * 结束这一轮，省掉一次空的 step。超时按「还有」处理，宁可多走一步也不丢内容。
+   */
+  toolCutWaitMs: 1500,
+  /**
+   * `session/prompt` 结算之后，还允许多久继续接收同一会话的帧（毫秒）。
+   *
+   * 实测 CodeBuddy 在 `PromptResponse` 之后仍可能补发帧（最终正文、标题、用量）。
+   * 一到结算就关掉通知队列会把它们丢掉，于是「最后那段正文」凭空消失。
+   * 这个窗口就是给尾帧留的时间；窗口结束后才真正收口。
+   */
+  settleGraceMs: 250,
   /** 工具结果在会话里展示的字符上限（完整输出仍保留在工具体里）。 */
   toolOutputLimit: 12000,
   /** 工具活动播报方式（`auto` = 回放模式下关闭）。 */
@@ -244,6 +271,9 @@ export function resolveConfig(raw) {
   if (merged.toolEmit !== 'start' && merged.toolEmit !== 'settle') {
     throw new Error(`${prefix}: toolEmit 必须是 start / settle 之一`)
   }
+  if (merged.toolCut !== 'step' && merged.toolCut !== 'turn') {
+    throw new Error(`${prefix}: toolCut 必须是 step / turn 之一`)
+  }
   if (typeof merged.toolReplay !== 'boolean') {
     throw new Error(`${prefix}: toolReplay 必须是布尔值`)
   }
@@ -306,6 +336,8 @@ export function resolveConfig(raw) {
     maxTokens: requirePositiveFinite(prefix, 'maxTokens', merged.maxTokens),
     toolInputLimit: requirePositiveFinite(prefix, 'toolInputLimit', merged.toolInputLimit),
     toolOutputLimit: requirePositiveFinite(prefix, 'toolOutputLimit', merged.toolOutputLimit),
+    toolCutWaitMs: requireNonNegativeInteger(prefix, 'toolCutWaitMs', merged.toolCutWaitMs),
+    settleGraceMs: requireNonNegativeInteger(prefix, 'settleGraceMs', merged.settleGraceMs),
     maxImageBytes: requirePositiveFinite(prefix, 'maxImageBytes', merged.maxImageBytes),
     maxImagesPerPrompt: requireNonNegativeInteger(prefix, 'maxImagesPerPrompt', merged.maxImagesPerPrompt),
     startupTimeoutMs: requirePositiveFinite(prefix, 'startupTimeoutMs', merged.startupTimeoutMs),

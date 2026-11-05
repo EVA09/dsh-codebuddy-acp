@@ -12,6 +12,9 @@
 - **每个模型都能选思考档位**（`low / medium / high / xhigh / max`，具体有哪几档由模型决定），
   选中即生效，换档位不丢上下文；
 - 选中哪个，CodeBuddy 就用哪个模型跑，**消耗的是你 CodeBuddy 账号里腾讯给的那份额度**；
+- **工具调用会变成 DSH 原生工具卡片，并在轮次中途逐个结算**：一次 ACP turn 被切成多个
+  step，每个工具在自己的那一步里执行并当场变成「完成」，助手正文留在它真实出现的位置
+  （见下文「工具调用怎么进 DSH」）；
 - **侧栏多一个 CodeBuddy 控制台**：看账号里真实的剩余积分、领每日积分、管理模型开关与顺序。
 
 ```
@@ -41,39 +44,56 @@ CodeBuddy 的 agent 循环在**它自己的进程里**执行工具，ACP 只会�
 四段式链路，界面渲染成工具卡片：类别、标题、路径、状态、可展开的真实输出。
 **不会**重复执行工具，也**不会**多跑一次模型请求。
 
+### 一次 ACP turn 切成多个 step（`toolCut: 'step'`，默认）
+
+DSH 只在**一个 step 的模型流结束之后**才执行这一步里的 `tool-call` 块。所以「一轮 ACP = 一个
+step」时，整轮的工具卡片要等 CodeBuddy 把这一轮跑完才一起结算——期间界面上全是「执行中」，
+而助手正文又被攒到最后，顺序看起来就不对。
+
+现在适配器把**同一条 ACP turn 切成多个 step**：
+
+```
+turn 1 ─┬─ step 1  assistant[思考, tool-call(Read a.txt, 已完成)] → tool/call → tool/result
+        ├─ step 2  assistant[tool-call(Read b.txt, 已完成)]      → tool/call → tool/result
+        └─ step 3  assistant[最终正文]                          ← 不含 tool-call，是最终答案
+```
+
+- **切点**：某个工具在 CodeBuddy 那边结算（`completed` / `failed`）时，当前 step 发完它的
+  `tool-call` 块就收口。DSH 立刻执行回放工具，卡片**当场**变成完成态，不再挂到轮末。
+- **不额外花钱**：step 之间**不发任何 ACP 请求**，CodeBuddy 那边仍然是「一轮跑完」，
+  后面的 step 只是把已经排队的帧接着取走（`session/prompt` 只发一次）。
+- **正文留在原位**：思考/正文按真实到达顺序落进它所属的那一步，结论天然落在最后一步
+  （那一步不含 `tool-call` 块，`ui-chat` 的 `latestAnswer` 才认得它是最终答案）。
+- **收口判断**：回放工具执行前先问桥「这条 ACP turn 还有没有后续内容」
+  （`toolCutWaitMs`，默认 1500ms）。还有就继续下一个 step；已经收口且没有剩余帧就
+  `concludeTurn()` 结束本轮，避免多出一个空的 step。
+
+实测（本机 v2.178.1，`test/step-cut.live.mjs`）：一条「读两个文件」的 turn 被切成 3 步，
+第 1 步在 7.7s 收口（整轮 9.4s）；含 5 秒慢命令的场景里，慢命令那一步 15.9s 收口、
+后面的读文件与结论各自只花 0-2ms（帧早已排队）。
+
+`toolCut: 'turn'` 是旧行为（一轮一个 step，工具卡片要等整轮结束才结算），保留给需要
+「所有工具块落在同一条 assistant 消息里」的组合；那种模式下 `toolEmit` 仍然生效。
+
 ### 卡片什么时候出现、长什么样
 
-DSH 只在**模型流结束之后**才执行工具，所以卡片从「出现」到「完成」之间隔着整轮 ACP。
-这带来两个观感问题，插件在两处分别处理：
+分段模式下工具块**只在结算后**发出（`toolEmit` 不参与），所以卡片一出现就是终态，
+多个工具按结算顺序逐个出现，一个工具一步。
 
-- **完成态**（`toolEmit: 'settle'`，默认）：等 CodeBuddy 把这次调用结算掉（`completed` /
-  `failed`）再发块。卡片一出现就是终态，多个工具按**结算顺序逐个**出现，不会一大串挂着
-  「执行中」。代价是工具在跑的那几十秒界面里没有卡片；想要「一看到就出现」就切
-  `toolEmit: 'start'`，但要接受完成态等到轮末。
 - **区分度**：所有 CodeBuddy 工具在 DSH 里共用一个回放工具名，DSH 自带「按工具名换图标/标题」
   用不上。所以 `client.js` 按**真实工具名**（`Read` / `Bash` / `Edit` / `Grep` / `Write`…）
   归到家族，各自一套徽章文案与配色（读取/命令/修改/写入/搜索/抓取/任务/待办/智能体），
   左侧还有一条同色竖条；主行只放「工具名 + 主语」，路径可点、命令走等宽字体。
 
-### 为什么结论要走「下一个 step」而不是跟工具块同一条消息
+### 为什么结论必须落在「不含 tool-call 块」的那一步
 
 DSH 的 Chat 只把**最后一个 step 中、且不含 `tool-call` 块**的 assistant 回复当作「最终答案」
 （`ui-chat` 的 `latestAnswer`：`blocks.some(block => block.kind === 'tool-call') ? null : data`）。
 其余正文一律算过程内容，会随整轮折叠一起收起——这就是「CodeBuddy 的结论被折叠」的根因。
 
-而 CodeBuddy 一轮 ACP prompt 里既跑工具又给出正文，原样塞进同一个 step 就必然混在一条消息里。
-所以本插件的做法是：
-
-1. 这一轮只要发过 `tool-call` 块，**正文先整段攒住**（`TurnEmitter.heldText`），不流出去；
-2. 轮末把它存进会话运行态（`SessionRecord.heldAnswer`），并在本轮每条工具记录上写
-   `holdAnswer: true`；
-3. 回放工具看到 `holdAnswer` 就**不调用** `concludeTurn()`，DSH 于是照常进入下一个 step；
-4. 下一个 step 里 DSH 没带新的用户消息，适配器就把攒住的正文作为一段干净的
-   `text` 块交出——那一步不含 `tool-call` 块，结论因此被认作最终答案，整轮折叠也收不走。
-
-纯工具轮（正文根本没出现）仍然由回放工具 `concludeTurn()` 结束，不多花一次请求。
-若 CodeBuddy 先吐了一句开场白再调工具，那段正文已经流出去了、收不回来，就整轮走老路径，
-不会出现「半句在这条消息、半句在下一个 step」的撕裂。
+分段模式天然满足：正文落在它自己的 step 里，结论那一步没有工具块。兼容模式
+（`toolCut: 'turn'`）则靠「正文先攒住（`TurnEmitter.heldText`）+ 记录上打 `holdAnswer`」，
+由下一个 step 单独交出。
 
 回放工具只在「这一轮的模型是 CodeBuddy」时可见（注册时按 `modelSelection.provider`
 过滤），换成别的模型时它既不在工具表里、也不进请求头。
@@ -386,7 +406,10 @@ dsh plugin --profile desktop add <workspace>\plugins\dsh-codebuddy-acp
 | `maxImageBytes` | `5242880` | 单张图投递的字节目标（5MB）；附件服务据此降质/降尺寸，也是 `imageRequestTarget` 返回值 |
 | `maxImagesPerPrompt` | `10` | 一次 prompt 最多投几张图；超出的只在正文留标号并注明原因 |
 | `replayImages` | `latest` | 重放完整历史时投哪些图：`latest`（只投最后一条用户消息）/ `all` / `none` |
-| `toolEmit` | `settle` | 什么时候发 `tool-call` 块：`settle`（等 CodeBuddy 把这次调用结算完再发，卡片一出现就是「完成」，多个工具按结算顺序逐个出现）/ `start`（一看到就发，卡片早出现但完成态要等整轮 ACP 结束） |
+| `toolEmit` | `settle` | 什么时候发 `tool-call` 块（**只在 `toolCut: 'turn'` 下生效**）：`settle`（等 CodeBuddy 把这次调用结算完再发）/ `start`（一看到就发，卡片早出现但完成态要等整轮 ACP 结束） |
+| `toolCut` | `step` | 一次 ACP turn 怎么切给 DSH 的 step：`step`（**每个工具独占一步**，卡片在轮次中途当场结算，正文留在原位）/ `turn`（一轮一个 step，旧行为，卡片要等整轮结束才结算） |
+| `toolCutWaitMs` | `1500` | `toolCut: 'step'` 下回放工具最多等多久来判断「这条 ACP turn 还有没有后续内容」；等不到就按「还有」处理（宁可多走一步也不丢正文） |
+| `settleGraceMs` | `250` | `session/prompt` 结算后还允许多久继续接收同一会话的尾帧（实测响应之后仍可能补发最终正文/标题/用量） |
 | `proxyFs` | `true` | 把 ACP 的 `fs/read_text_file`、`fs/write_text_file` 代理给 DSH 文件服务（失败回落本机 fs） |
 | `proxyTerminal` | `false` | 是否把 ACP 终端代理到本机（关闭时 CodeBuddy 自己执行命令） |
 | `startupTimeoutMs` | `60000` | 握手/建会话超时 |
@@ -401,11 +424,14 @@ dsh plugin --profile desktop add <workspace>\plugins\dsh-codebuddy-acp
 - **进程池**：`initialize` ≈1.6s，鉴权按需最坏十几秒，所以按**工作目录**共享一个
   `codebuddy --acp` 进程，进程内每条 DSH 会话各占一条 ACP 会话。进程内多轮 prompt 用
   连接级互斥闸门串行，避免互相打断。
-- **一次 `stream()` = CodeBuddy 完整跑一轮**：它有工具、权限、沙箱和自己的循环，
+- **一次 `stream()` = 一条 ACP turn 的一个 step**：CodeBuddy 有工具、权限、沙箱和自己的循环，
   所以这里**不把 DSH 的工具表交给它**；但它的每一次工具调用都会转成 DSH 的
   `tool-call` 块，并由回放工具带回真实结果（见上节「调用链」）。
+  默认 `toolCut: 'step'` 下，同一条 ACP turn 会跨多个 step 存活（`LiveTurn`），
+  step 之间不发任何 ACP 请求。
 - **增量投喂**：DSH 每一步都会重发整段历史。适配器为每条消息算签名，比对「已转发前缀」，
   只把新增的用户消息发给已在运行的 ACP 会话；前缀对不上（压缩、回滚）才重放全部历史。
+  分段模式下，续段产生的 assistant/tool 消息也记进签名（它们进 DSH 历史但没再发给 CodeBuddy）。
 - **换模型不重开**：`session/set_config_option {configId:"model", value}`（有校验），失败才
   退化成「新开 ACP 会话 + 重放历史」。不用 `session/set_model`——它不校验 modelId。
 - **思考档位是会话级的**：`thought_level` 与 `model` 一样挂在 ACP 会话上，所以换档位**不重开会话**；
@@ -414,6 +440,9 @@ dsh plugin --profile desktop add <workspace>\plugins\dsh-codebuddy-acp
 - **块编排按时间顺序**：思考串流、正文串流、**每次工具调用独占一个块**，块切换时立刻发
   `block-end`（旧实现把整轮的思考与工具播报塞进一个块、所有 `block-end` 拖到轮末，
   于是界面长时间不动、工具结果完全看不到）。
+- **发块即收口**（`toolCut: 'step'`）：工具块一发出就结束当前 step，DSH 立刻执行回放工具、
+  卡片当场变成完成态。所以卡片不会再「挂到轮末」；代价是同一轮会出现多条 step 级消息
+  （Chat 里每个带正文的 step 各自成段，`foldedReplies` 默认把过程段折叠起来）。
 - **占位帧先压住**：实测 CodeBuddy 会先发一条 `kind=other`、标题只有 `Read` 的占位
   `tool_call`，稍后才补一条带绝对路径与正确 `kind` 的同 id `tool_call`。适配器把占位帧
   压在滞留队列里，等补全帧到了再一次性发块——否则卡片上只有 `Read`、没有路径。
@@ -442,6 +471,7 @@ dsh plugin --profile desktop add <workspace>\plugins\dsh-codebuddy-acp
 | 思考过程 | `agent_thought_chunk` → `reasoning-delta` | ✅ 实测 |
 | **图片输入** | DSH `ImageBlock` → `ctx.attachments` 读字节 → `session/prompt` 的 `{type:'image',data,mimeType}` 内容块 | ✅ 实测 |
 | 工具调用可见性 | `tool_call` / `tool_call_update` → **原生 `tool-call` 块 + `codebuddy_tool` 回放工具 + 客户端工具卡片** | ✅ 实测 |
+| **工具卡中途结算** | 一次 ACP turn 切成多 step（`toolCut: 'step'`）：每个工具独占一步，卡片在轮次中途变成完成态 | ✅ 实测（真机 + 真 DSH） |
 | **会话标题** | `session_info_update.title` → `ctx.sessionTitle.rename()`（钉住标题） | ✅ 实测 |
 | **待办计划** | `TaskCreate`/`TaskUpdate` 的 `_meta['codebuddy.ai/rawResponse'].todos` → `todo/write` → DSH 待办面板 | ✅ 实测 |
 | 权限模式 | `--permission-mode` | ✅ 实现 |
@@ -492,6 +522,11 @@ dsh plugin --profile desktop add <workspace>\plugins\dsh-codebuddy-acp
   大图会先被附件服务降质/降尺寸再发，仍超限的会注明「未发送」。
 - **上下文压缩是本地确定性摘要**，不是模型生成的摘要；CodeBuddy 侧上下文仍完整。
 - **首轮成本偏高**：CodeBuddy 每轮都会带自己的系统提示与工具定义（约 2.7 万 input tokens）。
+- **一轮会出现多个 step**：`toolCut: 'step'` 下每个工具一步，所以 Chat 里同一轮会有多条
+  step 级消息（默认 `foldedReplies` 会把过程段折叠成「工作 Xs」，会话统计的步数也会变多）。
+  这是「卡片当场结算」的代价；想回到「一轮一条消息」就设 `toolCut: 'turn'`。
+- **并发工具按结算顺序落地**：CodeBuddy 实测串行执行工具；若将来并行，适配器按**结算顺序**
+  逐个发块（每个工具仍独占一步），不会把并行的几个调用塞进同一张卡片。
 
 ## 自测
 
@@ -503,6 +538,8 @@ node test/run.mjs --models                       # 只列模型（不发起对�
 node test/run.mjs "用一句话回答：1+1等于几？"      # 真跑一轮（默认取目录里第一个模型）
 $env:CB_MODEL='hy3'; node test/run.mjs "1+1=?"    # 指定模型
 $env:CB_LOG='info';  node test/run.mjs "1+1=?"    # 打印每条 ACP 通知
+node test/step-cut.live.mjs                       # 分段 step：读两个文件，断言 3 步、卡片终态、只发一次 prompt
+node test/step-cut.live.mjs --slow                # 含 5 秒慢命令：验证慢工具那一步不会被提前收口
 ```
 
 离线测试（不触网、不改变账号状态）：
@@ -529,6 +566,10 @@ node probe/capture-frames.mjs --mode plan "请用 TodoWrite 建立任务清单�
 `tool-replay.test.mjs` 用同一份真实帧序列断言「工具调用完整进 DSH」的每一步：
 占位帧不抢跑、同一 `toolCallId` 只产生一个块、块的参数结构（`title` 在最前）、
 结果进桥并被回放工具取回、`concludeTurn()` 只结算一次、历史投喂不再回灌工具参数与结果。
+它还断言**分段 step** 的核心形状：两个工具各自独占一步（`['reasoning','tool-call']` →
+`['tool-call']` → `['text']`）、工具块发块时就是终态、夹在工具之间的正文留在原位、
+纯工具轮由回放工具 `concludeTurn()` 收口、兼容模式仍然走 `holdAnswer`。
+测试里的 `driveSteps()` 就是在模拟 DSH 的 agent loop（每步执行本步的 tool-call 块再决定是否继续）。
 
 `reasoning-and-blocks.test.mjs` 用**假 ACP 连接**回放 2026-10-28 抓到的真实帧序列，
 覆盖两个已修复的问题：档位是否真的写进 CodeBuddy（含非法档位不阻断、同档位不重复写）、
@@ -554,8 +595,7 @@ node test/billing-live.mjs    # 打印真实剩余积分、额度包与今日签
 
 ### 端到端（真跑 DSH + 真跑 CodeBuddy 工具）
 
-装好插件后，用装好的运行时把一轮「读文件」任务跑穿，然后看会话日志里有没有
-`assistant/message(tool-call) → tool/call → tool/result` 四段：
+装好插件后，用装好的运行时把一轮「读文件」任务跑穿，然后看会话日志里的 step 结构：
 
 ```powershell
 # 1) 建一个专用 profile，并让默认模型走 CodeBuddy
@@ -566,18 +606,27 @@ dsh --profile headless --dump-config > $null      # 首次会生成 profile 目�
 #     config: { provider: codebuddy, model: deepseek-v4.1-flash }
 dsh plugin --profile headless add <本目录绝对路径>
 
-# 2) 跑一轮会触发工具的任务
-dsh --profile headless --json "用 Read 工具读 <本目录>\package.json 的第 1-3 行，告诉我 name"
+# 2) 跑一轮会触发工具的任务（也可以用 --patch 挂一份临时 overlay，见下）
+dsh --profile headless "读取 package.json 和 README.md 的第一行，告诉我各写了什么"
 
-# 3) 期望在输出里看到 tool_call / tool_result 两类事件，且只有一次 step_end
+# 3) 期望：每个工具各自一个 step，且 tool/result 出现在该 step 内
 ```
 
-实测（2026-10-29，CodeBuddy CLI v2.177.1，装好的 DSH 0.2.1-rc.3）：
+实测（2026-11-03，CodeBuddy CLI v2.178.1，DSH 0.2.1-rc.5，`toolCut: 'step'`）：
 
 ```
-{"type":"tool_call","tool":"codebuddy_tool","input":{"title":"Read …\\package.json (1 - 3)","kind":"read","path":"…","status":"pending"}}
-{"type":"tool_result","callId":"call_00_…","status":"completed","result":"✓ Read …\n\n   1→{\n   2→  \"name\": \"dsh-codebuddy-acp\","}
-{"type":"status","phase":"step_end","turn":1,"step":1,"usage":{...}}   ← 只有一次模型请求
+turn1 step1  assistant[tool-call Read package.json] → tool/call → tool/result → step/end
+turn1 step2  assistant[tool-call Read README.md]    → tool/call → tool/result → step/end
+turn1 step3  assistant[text]                        → step/end → turn/end
+```
+
+即：**工具卡片在轮次中途就结算完成**，最终正文单独落在最后一步（`latestAnswer` 认得它）。
+改造前是「一轮一个 step」，所有工具卡片都要等 turn 结束才一起执行、一起结算。
+
+用临时 overlay 试跑（不改 profile 本体）：
+
+```powershell
+dsh headless --patch .\e2e.overlay.yml "任务"   # overlay 内容见上「配置」一节的示例
 ```
 
 ## 参考资料

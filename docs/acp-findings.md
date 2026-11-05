@@ -1370,3 +1370,116 @@ DSH 的审批结果只有 `allowed-once` / `rejected` 两种（`ui-approval` 的
 - stdout 缓冲超 `LINE_LIMIT`（32MB）时**清空缓冲继续跑**，等于把协议流截断后接着解析，
   之后所有帧都会错位。更安全的做法是直接关连接并报错。
 - `#write` 不看 `stdin.write()` 的返回值，也不等 `drain`；重放超长历史时理论上会堆内存。
+
+---
+
+## 19. 工具卡片「卡在中间」的根因与分段 step（2026-11-03，v0.6.0）
+
+### 19.1 现象与根因
+
+现象：一轮会话没结束之前，所有工具调用都停在「执行中」，助手正文被推到整轮最后，
+工具帧与正文的顺序看起来是错的。
+
+根因不是 ACP 侧的顺序（那是对的），而是 **DSH 侧的执行时机**：
+
+`packages/core/agent-loop/src/agent.ts` 的 `step()` 里，`for await (const chunk of stream)`
+把模型流收完之后，才 `createAssistantMessage({content: live.blocks()})`，然后
+
+```ts
+const toolCalls = message.content.filter(block => block.type === 'tool-call')
+...
+const result = await this.loopCtx.tools.execute({ calls: toolCalls, ... })
+return result.concluded ? { kind: 'completed' } : null
+```
+
+也就是说：**一个 step 里的工具调用，只在这一步的模型流结束之后才执行**。
+旧实现「一轮 ACP = 一个 step」，于是整轮的工具卡片都堆到轮末才一起执行、一起结算；
+期间界面上全是「执行中」，而正文又被 `heldText` 攒到最后一步。
+
+### 19.2 真实帧顺序（18 个 turn 的统计，`research/frames.md`）
+
+| 事实 | 结论 |
+|---|---|
+| 正文会不会夹在两个工具之间 | **不会**（18 个 turn 全 0 次）；正文一律落在最后一个工具之后 |
+| 思考（`agent_thought_chunk`）会不会夹在中间 | **会**，而且是常态 |
+| 每个工具 id 的 `tool_call` 帧数 | **恰好 2 条**：占位（`kind=other`、无参数）→ 补全（带真实命令/路径） |
+| 状态链 | `in_progress → pending → [in_progress] → completed/failed`，**会回退**（不能按单调状态机写） |
+| `tool_call_update` 先于 `tool_call` | 0 次 |
+| `completed` 之后又回到 `in_progress` | 0 次 |
+| 并行工具 | 原始帧里**严格串行**（未结算 id 峰值 1）；但并行确实存在（`session-events.txt` 有 11 条 `call_01_*` 分支） |
+| `usage_update` | 每轮模型请求一条结算帧 + 一条上下文帧；**最后一条常常就是 PromptResponse 前的最后一帧** |
+| 最后工具结算 → PromptResponse | 8 工具 turn 里还有 **6024ms / 1462 帧 / 1455 个正文 chunk（2241 字）** |
+
+推论：**在「工具结算」处切 step 是安全的**——切点之后还有一大段（最终正文）要交给下一步，
+不会出现「切完就没内容了」的空步；而正文既然不会夹在两个工具之间，切分也不会把一句话切碎。
+
+### 19.3 改造：一次 ACP turn 切成多个 step
+
+新增 `LiveTurn`（跨 step 存活的一条 ACP turn）与 `ReplayQueue`（已结算待发块的调用队列）：
+
+- 连接监听把**需要按 step 渲染**的帧（正文/思考/工具/计划/阶段）推进 `UpdateQueue`，
+  `usage_update` 与标题、待办同步是**会话级**的，立即处理；
+- 每个 step 建一个 `TurnEmitter`（块 index 从 0 开始），从队列里取帧渲染；
+- 一旦某条工具记录结算（`completed` / `failed`），就把它的 `tool-call` 块发出去，
+  **发块即收口本 step**（`finish.reason = {kind:'tool-calls'}`）；
+- DSH 执行回放工具时，工具先问桥「这条 ACP turn 还有没有后续内容」
+  （`ToolCallBridge#continuationOf` → `LiveTurn#whenMore`）：有就不 `concludeTurn()`，
+  DSH 自然进入下一个 step；没有（已收口且队列空）就 `concludeTurn()` 结束本轮，
+  避免多出一个空 step；
+- 下一个 step 进来时 `record.live` 还在 → 走 `#continueTurn`，**不发任何 ACP 请求**，
+  只接着取帧；整轮仍然只发一次 `session/prompt`。
+
+配套细节：
+
+- **签名**：`sent` 记在 `LiveTurn` 上（收口可能发生在第 N 步，局部变量留不住）；
+  续段产生的 assistant/tool 消息由 `#recordContinuation` 记进签名（遇到用户消息就停，
+  那是中途插话、属于下一轮要投喂的内容）。
+- **用量**：`usageDelta()` 按增量发（DSH 的 `deriveTurnTokenUsage` 对每个 attempt 做 `safeSum`，
+  分步增量相加正好是整轮总量），不会重复计入。
+- **`whenMore` 失败要报 'more'**：失败时若判成 'done' 并 `concludeTurn()`，
+  错误会被吞掉（用户只看到工具卡片、看不到报错）；判成 'more' 才能让下一步把错误交出去。
+- **空步兜底**：`hasMore` 只把「会产生可见块」的帧算作后续内容（阶段帧/计划帧在回放模式下
+  不产生输出），避免因为一条 `idle` 阶段帧多开一个空 step。
+- **`agentPhase` 是「后面还有帧」的确定信号**：实测 `model_requesting` 紧跟工具 `completed`
+  之后（+2ms），而最终正文往往要等这次模型请求跑完（本机实测 6s 级）。所以 `hasMore` 在
+  `phase === 'model_requesting' | 'model_streaming'` 时直接返回真，不必干等 `toolCutWaitMs`
+  超时；超时（`unknown`）时**按「还有」处理**，宁可多走一步也不能把最终正文丢掉。
+- **尾帧收尾窗口（`settleGraceMs`，默认 250ms）**：实测 `PromptResponse` 之后同一会话仍会
+  补发帧（最终正文、标题、用量）。一到结算就关闭通知队列会把它们全丢掉——改造过程中真的
+  踩到过「最终正文凭空消失」。现在队列延迟关闭、订阅也在窗口结束后才摘。
+
+### 19.4 真机证据
+
+适配器直连（`test/step-cut.live.mjs`，v2.178.1，`deepseek-v4.1-flash`）：
+
+```
+[ 10867ms] ── step 1（用时 9128ms）  块：reasoning → tool-call(call_00)  卡：Read a.txt｜completed
+[ 10868ms] ── step 2（用时 1ms）     块：tool-call(call_01)             卡：Read b.txt｜completed
+[ 10869ms] ── step 3（用时 1ms）     块：text（结论 91 字）             终止：stop
+```
+
+含 5 秒慢命令的场景（`--slow`）：step 1 在 15.9s 收口（慢命令结算），step 2/3 各 0-2ms
+（帧早已排队）。整轮 17.5s，说明卡片是在**轮次中途**结算的，不是等整轮结束。
+
+真 DSH 端到端（`dsh headless --patch <overlay>`，DSH 0.2.1-rc.5）的会话日志：
+
+```
+turn1 step1  assistant[tool-call Read package.json] → tool/call → tool/result → step/end
+turn1 step2  assistant[tool-call Read README.md]    → tool/call → tool/result → step/end
+turn1 step3  assistant[text]                        → step/end → turn/end
+```
+
+改造前同样任务只有一个 step，两条 `tool/call` 与 `tool/result` 全落在它后面。
+
+### 19.5 已知代价（DSH 客户端侧）
+
+`packages/client/ui-chat` 的 `latestAnswer`（`turn-process.ts:157-162`）只认「最后一个 step、
+有可见内容、且整条消息不含 tool-call 块」；顺序纯按 `ChatNode.anchorSeq` 升序，工具卡锚在
+`tool/call` 的 seq 上、`tool/result` 只更新数据不动位置（`tool.ts:343-344`）——所以分段渲染
+的顺序是对的，卡片也会就地变成完成态。
+
+代价是**视觉割裂**：每个带正文的 step 各自成一个 `div.flowItem` 节点、回复行不并入 step run
+（`process-groups.ts:147-163`），默认 `foldedReplies: 'all'` 下 N 步就是 N 段过程组；
+会话统计的步数也按 `step/start` 放大。这属于「卡片当场结算」换来的可接受代价，
+想回到「一轮一条消息」可以设 `toolCut: 'turn'`。
+

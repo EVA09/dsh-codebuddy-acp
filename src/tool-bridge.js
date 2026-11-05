@@ -196,6 +196,38 @@ export class ToolCallBridge {
     this.ttlMs = Number.isFinite(ttlMs) && ttlMs > 0 ? ttlMs : DEFAULT_TTL_MS
     this.maxRecords = Number.isFinite(maxRecords) && maxRecords > 0 ? maxRecords : DEFAULT_MAX_RECORDS
     this.outputLimit = Number.isFinite(outputLimit) && outputLimit > 0 ? outputLimit : DEFAULT_OUTPUT_LIMIT
+    /**
+     * 「这条调用所属的 ACP turn 还有没有后续内容」的探针，由适配器注入。
+     *
+     * 回放工具需要它来决定是不是 `concludeTurn()`：还有内容就必须让 DSH 进入下一个 step，
+     * 否则那些内容（正文/下一个工具）会永远没人取走。
+     *
+     * @type {((callId: string) => { whenMore: (timeoutMs: number) => Promise<'more' | 'done' | 'unknown'> } | undefined) | undefined}
+     */
+    this.liveProbe = undefined
+  }
+
+  /**
+   * 注入续段探针（适配器在构造时调用一次）。
+   * @param {(callId: string) => object | undefined} probe 探针。
+   */
+  setLiveProbe(probe) {
+    this.liveProbe = probe
+  }
+
+  /**
+   * 问「这次工具调用之后，ACP turn 还有没有内容要交给 DSH」。
+   *
+   * @param {string} callId 工具调用 id。
+   * @param {number} timeoutMs 最多等多久（毫秒）。
+   * @returns {Promise<'more' | 'done' | 'unknown' | undefined>} 判断结果；
+   *   `undefined` 表示没有探针（兼容模式，调用方按旧规则处理）。
+   */
+  async continuationOf(callId, timeoutMs) {
+    if (this.liveProbe === undefined) return undefined
+    const live = this.liveProbe(callId)
+    if (live === undefined) return undefined
+    return await live.whenMore(timeoutMs)
   }
 
   /**

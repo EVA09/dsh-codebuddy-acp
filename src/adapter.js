@@ -6,15 +6,18 @@
  * - **一个 CodeBuddy 进程（每个工作目录一个）= 一条 ACP 连接**，连接里可以开多条 ACP 会话；
  *   一条 DSH 会话就对应其中一条 ACP 会话。之所以共享进程，是因为
  *   `initialize`(≈1.6s) + `authenticate`(≈10s) 的固定开销太大，按会话起进程不可接受。
- * - **一次 `stream()` = CodeBuddy 自己跑完一轮 agent 循环**。它有工具、权限、沙箱，
- *   所以这里**不把 DSH 的工具表交给它**，也不产出 `tool-call` 块，让它原生产出最终答复。
+ * - **一次 `stream()` = 一条 ACP turn 的一个 step**。默认 `toolCut: 'step'` 下，CodeBuddy 跑的
+ *   那一轮会被切成多个 step（每个工具结算即收口一步，见 {@link LiveTurn}），
+ *   这样 DSH 才能在轮次中途执行回放工具、让工具卡片当场结算。
+ *   CodeBuddy 自己有工具、权限、沙箱，所以这里**不把 DSH 的工具表交给它**；
+ *   它的工具调用会变成 DSH 的 `tool-call` 块 + `codebuddy_tool` 回放。
  * - **增量投喂**：DSH 每一步都会重发整段历史，这里比对「已转发消息签名」，只把新增的
  *   用户消息发给已在运行的 ACP 会话；前缀对不上（压缩、回滚）才重放全部历史。
  * - **换模型不重开会话**：走 `session/set_config_option {configId:'model'}`（带校验），
  *   对话上下文因此得以保留；只有切到账号不可用的模型才会退化成「新开 ACP 会话 + 重放历史」。
  * - **用量来自 `usage_update` 通知**：`session/prompt` 的结果里没有 usage 字段。
  *
- * 协议事实来自 `docs/acp-findings.md`（本机实测，v2.177.1）。
+ * 协议事实来自 `docs/acp-findings.md`（本机实测，v2.178.1）。
  *
  * @module src/adapter.js
  */
@@ -38,7 +41,7 @@ import {
 } from './models.js'
 
 /** 客户端身份（会出现在 CodeBuddy 日志里）。 */
-const CLIENT_INFO = Object.freeze({ name: 'dsh-codebuddy-acp', version: '0.5.0' })
+const CLIENT_INFO = Object.freeze({ name: 'dsh-codebuddy-acp', version: '0.6.0' })
 
 /** 同时保留的空闲连接上限。 */
 const MAX_IDLE_CONNECTIONS = 4
@@ -326,17 +329,22 @@ class UsageLedger {
  */
 class TurnEmitter {
   /**
-   * @param {ChunkQueue} queue 输出队列。
-   * @param {object} [options] 选项。
+   * @param {object} options 选项。
+   * @param {(chunk: object) => void} options.emit 输出回调（本 step 的 chunk 落到调用方缓冲区）。
    * @param {import('./tool-bridge.js').ToolCallBridge} [options.bridge] 工具记录桥。
+   * @param {ReplayQueue} [options.tools] 分段模式的「已结算待发块」队列（见 {@link ReplayQueue}）。
+   * @param {Set<string>} [options.emitted] 已经发过 tool-call 块的调用 id（跨 step 共享）。
    * @param {string} [options.toolName] 回放工具名（tool-call 块里的 `name`）。
    * @param {boolean} [options.replay] 是否走「原生工具块 + 回放工具」模式。
    * @param {'text' | 'reasoning' | 'off'} [options.narration] 旧模式下的播报位置。
    * @param {'start' | 'settle'} [options.emitOn] 何时发 tool-call 块（见 config.toolEmit）。
    */
-  constructor(queue, options = {}) {
-    this.queue = queue
+  constructor(options = {}) {
+    if (typeof options.emit !== 'function') throw new TypeError('TurnEmitter 需要 emit 回调')
+    this.emit = options.emit
     this.bridge = options.bridge
+    /** 分段模式的工具队列；有它就说明「结算即发块、发块即收口本 step」。 */
+    this.tools = options.tools
     this.toolName = options.toolName ?? 'codebuddy_tool'
     this.replay = options.replay !== false && options.bridge !== undefined
     this.narration = options.narration ?? 'reasoning'
@@ -356,9 +364,9 @@ class TurnEmitter {
     this.answerChars = 0
     /** 旧模式的工具记录（播报用）。 */
     /** @type {Map<string, { id: string, title: string, kind?: string, status: string, text: string }>} */
-    this.tools = new Map()
-    /** 已发过 tool-call 块的调用 id。 */
-    this.emitted = new Set()
+    this.narrationTools = new Map()
+    /** 已发过 tool-call 块的调用 id（跨 step 共享，所以由调用方传入）。 */
+    this.emitted = options.emitted ?? new Set()
     /** 已见到但还「不够像样」的调用（等标题补全），保持插入顺序。 */
     this.held = []
     /** 已播报过的阶段，避免同一阶段反复刷屏。 */
@@ -367,28 +375,30 @@ class TurnEmitter {
     this.answerIndexes = []
     /** 每个块已累计的文本（收口时写进 block-end）。 */
     this.texts = new Map()
-    /** 队列关闭之后攒下的 chunk，由 {@link close} 交回调用方直接 yield。 */
-    this.tail = []
-    /** 本轮是否发出过工具调用块。 */
+    /** 本 step 已经发过工具块（分段模式下它意味着「这个 step 该收口了」）。 */
+    this.cutRequested = false
+    /** 本 step 是否发出过工具调用块。 */
     this.toolCallCount = 0
     /**
      * 回放模式下暂存的**最终正文**（等下一个 step 再交给 DSH），以及
      * 已经真流出去的正文字符数（用来判断还能不能干净地暂存）。
      *
-     * 见 {@link TurnEmitter.pushText} 与 `CodeBuddyAdapter#run` 的说明：
-     * 正文和 tool-call 块若落进同一条 assistant 消息，DSH 就不把它当最终答案。
+     * 只在兼容模式（`toolCut: 'turn'`，一轮一个 step）下启用：那种模式下正文与
+     * tool-call 块落进同一条 assistant 消息，DSH 就不把正文当最终答案，只能攒到下一步。
+     * 分段模式（`toolCut: 'step'`）里正文天然落在自己那一步，不需要暂存。
+     *
+     * 见 {@link TurnEmitter.pushText}。
      */
     this.heldText = ''
     this.streamedTextChars = 0
   }
 
   /**
-   * 输出一个 chunk：队列还开着就入队，已经收口就攒进 tail。
+   * 输出一个 chunk。
    * @param {object} chunk chunk。
    */
   #output(chunk) {
-    if (this.queue.ended) this.tail.push(chunk)
-    else this.queue.push(chunk)
+    this.emit(chunk)
   }
 
   /**
@@ -455,6 +465,22 @@ class TurnEmitter {
     })
     this.emitted.add(record.callId)
     this.toolCallCount += 1
+  }
+
+  /**
+   * 分段模式：把已经结算、还没发块的调用就地发成 tool-call 块，并请求收口本 step。
+   *
+   * 为什么「发块」必须等于「收口本 step」：DSH 只在**一个 step 的模型流结束之后**
+   * 才执行这一步里的 `tool-call` 块。所以块留在流里越久，卡片挂着「执行中」的时间就越长。
+   * 这里发完就收口，DSH 立刻执行回放工具、卡片当场变成完成态，下一个 step 再继续。
+   *
+   * @returns {number} 本次发出去的块数；大于 0 表示调用方应当结束当前 step。
+   */
+  emitReady() {
+    const records = this.tools?.take() ?? []
+    for (const record of records) this.#emitToolBlock(record)
+    if (records.length > 0) this.cutRequested = true
+    return records.length
   }
 
   /**
@@ -529,8 +555,9 @@ class TurnEmitter {
    */
   pushText(delta) {
     if (typeof delta !== 'string' || delta === '') return
-    if (this.replay && this.toolCallCount > 0 && this.streamedTextChars === 0) {
-      // 本轮已经发过工具块、而且还没有任何正文流出去：整段正文先攒住，交给下一个 step。
+    if (this.replay && this.tools === undefined && this.toolCallCount > 0 && this.streamedTextChars === 0) {
+      // 兼容模式（一轮一个 step）：本轮已经发过工具块、而且还没有任何正文流出去，
+      // 整段正文先攒住交给下一个 step，否则它会和 tool-call 块落进同一条消息而被折叠。
       this.heldText += delta
       return
     }
@@ -578,22 +605,24 @@ class TurnEmitter {
   /**
    * 处理 `tool_call`（既可能是新的工具，也可能是同一 id 的标题更新）。
    *
-   * 回放模式：写入记录桥，等信息够完整时发一个原生 `tool-call` 块；
+   * 回放模式：只把记录写进桥。**发块**的时机由 {@link ReplayQueue} 决定——
+   * 分段模式等它结算后由 {@link emitReady} 发出，兼容模式由 {@link #flushHeld} 发出。
    * 旧模式：把「▸ 标题」播报进推理块。
    *
    * @param {object} update ACP 更新。
    */
   toolCall(update) {
     if (this.replay) {
-      this.#track(this.bridge.begin(update))
+      const record = this.bridge?.begin(update)
+      if (this.tools === undefined) this.#track(record)
       return
     }
     if (this.narration === 'off') return
-    const id = typeof update.toolCallId === 'string' ? update.toolCallId : `tool-${this.tools.size}`
+    const id = typeof update.toolCallId === 'string' ? update.toolCallId : `tool-${this.narrationTools.size}`
     const title = typeof update.title === 'string' && update.title.length > 0
       ? update.title.trim()
       : typeof update.kind === 'string' ? update.kind : '工具'
-    const existing = this.tools.get(id)
+    const existing = this.narrationTools.get(id)
     if (existing !== undefined) {
       // 同一 id 二次 `tool_call`：实测是「标题从 Read 变成 Read <路径>」的补全，
       // 不重复开块，只更新记录里的标题（最终摘要用得到）。
@@ -601,7 +630,7 @@ class TurnEmitter {
       if (typeof update.kind === 'string' && update.kind !== 'other') existing.kind = update.kind
       return
     }
-    this.tools.set(id, {
+    this.narrationTools.set(id, {
       id,
       title,
       kind: typeof update.kind === 'string' ? update.kind : undefined,
@@ -626,12 +655,14 @@ class TurnEmitter {
   toolUpdate(update, sessionId) {
     this.onToolUpdate?.(sessionId, update)
     if (this.replay) {
-      this.#track(this.bridge.settle(update))
+      const record = this.bridge?.settle(update)
+      if (this.tools === undefined) this.#track(record)
+      else this.tools.note(record)
       return
     }
     if (this.narration === 'off') return
     const id = typeof update.toolCallId === 'string' ? update.toolCallId : ''
-    const tool = this.tools.get(id)
+    const tool = this.narrationTools.get(id)
     if (tool === undefined) return
     if (typeof update.title === 'string' && update.title.length > 0) tool.title = update.title.trim()
     if (typeof update.kind === 'string' && update.kind !== 'other') tool.kind = update.kind
@@ -668,11 +699,6 @@ class TurnEmitter {
     return this.answerChars > 0
   }
 
-  /** @returns {boolean} 本轮是否发出过工具调用块。 */
-  hasToolCalls() {
-    return this.toolCallCount > 0
-  }
-
   /**
    * 把「本轮还有正文待发」这个事实写到本轮每条工具记录上。
    *
@@ -689,15 +715,15 @@ class TurnEmitter {
   }
 
   /**
-   * 收口所有仍未关闭的块：先把滞留的工具调用发掉，再关当前块。
-   * @returns {object[]} 需要 yield 的 chunk。
+   * 收口当前 step：先把滞留的工具调用发掉，再关当前块。
+   *
+   * @returns {object[]} 需要由调用方 yield 的 chunk（兼容模式下可能有；分段模式下恒为空，
+   *   chunk 已经通过 `emit` 回调交出去了）。
    */
   close() {
     this.#flushHeld(true)
     this.#close()
-    const out = this.tail
-    this.tail = []
-    return out
+    return []
   }
 
   /**
@@ -709,7 +735,7 @@ class TurnEmitter {
    */
   summary() {
     if (this.replay) return []
-    const tools = [...this.tools.values()].filter((tool) => tool.text !== '' || tool.status !== 'pending')
+    const tools = [...this.narrationTools.values()].filter((tool) => tool.text !== '' || tool.status !== 'pending')
     if (tools.length === 0) return []
     const lines = tools.map((tool) => {
       const mark = tool.status === 'completed' ? '✓' : tool.status === 'failed' ? '✗' : '·'
@@ -728,6 +754,569 @@ class TurnEmitter {
     return out
   }
 }
+
+/**
+ * 一个 step 里「已经结算、还没发块」的工具调用队列。
+ *
+ * 一次 ACP turn 会被切成多个 DSH step（见 {@link LiveTurn}），所以哪些调用已经发过块
+ * 必须**跨 step** 记账：这里只记 `callId`，记录本体仍在 {@link ToolCallBridge} 里。
+ */
+class ReplayQueue {
+  /**
+   * @param {import('./tool-bridge.js').ToolCallBridge} [bridge] 工具记录桥。
+   */
+  constructor(bridge) {
+    this.bridge = bridge
+    /** 已结算、待发块的 callId（按结算顺序；结算顺序就是用户该看到的顺序）。 */
+    this.ready = []
+    /** 已经发过块的 callId（跨 step 共享）。 */
+    this.done = new Set()
+  }
+
+  /**
+   * 登记一条工具记录：结算完成的才排队。
+   * @param {import('./tool-bridge.js').ToolCallRecord | undefined} record 记录。
+   */
+  note(record) {
+    if (record === undefined) return
+    if (record.status !== 'completed' && record.status !== 'failed') return
+    if (this.done.has(record.callId)) return
+    if (this.ready.includes(record.callId)) return
+    this.ready.push(record.callId)
+  }
+
+  /**
+   * 取走所有待发块的记录。
+   * @returns {import('./tool-bridge.js').ToolCallRecord[]} 记录列表。
+   */
+  take() {
+    const ids = this.ready.splice(0)
+    const records = []
+    for (const callId of ids) {
+      if (this.done.has(callId)) continue
+      this.done.add(callId)
+      const record = this.bridge?.read(callId)
+      if (record !== undefined) records.push(record)
+    }
+    return records
+  }
+
+  /** @returns {number} 还有多少条等着发块。 */
+  get size() {
+    return this.ready.length
+  }
+}
+
+/**
+ * 一次 ACP `session/prompt` 的「现场」，跨多个 DSH step 存活。
+ *
+ * 为什么需要它：DSH 只在**一个 step 的模型流结束之后**才执行这一步的 `tool-call` 块。
+ * 「一轮 ACP = 一个 step」就意味着整轮的工具卡片要等 ACP 跑完才一起结算，
+ * 期间界面上全是「执行中」。这里把同一次 ACP turn 拆成若干个 step：
+ *
+ * - 每有一个工具结算，当前 step 就在发完它的 `tool-call` 块后收口；
+ * - DSH 立刻执行回放工具，卡片当场变成完成态；
+ * - 剩下的帧（思考/正文/下一个工具）留给下一个 step 消费，**不重新 prompt**。
+ *
+ * step 之间没有任何 ACP 请求，所以切分不会多花额度；ACP 侧仍然是「一轮跑完」。
+ */
+class LiveTurn {
+  /**
+   * @param {object} options 参数。
+   * @param {object} options.config 生效配置。
+   * @param {{ info?: Function, warn?: Function }} options.logger 日志器。
+   * @param {object} options.connection ACP 连接。
+   * @param {string} options.sessionId ACP 会话 id。
+   * @param {import('./tool-bridge.js').ToolCallBridge} [options.bridge] 工具记录桥。
+   * @param {boolean} options.replay 是否走回放模式（发 tool-call 块）。
+   * @param {boolean} options.cut 是否按工具结算切分 step（`toolCut: 'step'`）。
+   * @param {string | undefined} options.narration 兼容模式的播报位置。
+   * @param {object} options.emitterOptions 传给 {@link TurnEmitter} 的其余选项。
+   * @param {(entries: object[]) => void} [options.onPlan] 计划同步钩子。
+   * @param {(title: string) => void} [options.onTitle] 标题钩子。
+   */
+  constructor(options) {
+    this.config = options.config
+    this.logger = options.logger
+    this.connection = options.connection
+    this.sessionId = options.sessionId
+    this.bridge = options.bridge
+    this.emitterOptions = options.emitterOptions ?? {}
+    this.replay = this.emitterOptions.replay === true
+    this.cut = this.replay && options.cut === true
+    this.narration = this.emitterOptions.narration
+    this.onPlan = options.onPlan
+    this.onTitle = options.onTitle
+    /**
+     * 收口通知：这一轮结束时调用（无论是否有 step 在消费）。
+     * @type {((live: LiveTurn) => void) | undefined}
+     */
+    this.onSettled = options.onSettled
+    /** @type {object | undefined} 共享连接（取连接级闸门用，取消时也用它兜底）。 */
+    this.shared = options.shared
+    /** 已经发过块的调用 id（跨 step 共享）。 */
+    this.emitted = new Set()
+    /** 分段模式的待发块队列；兼容模式为 `undefined`。 */
+    this.tools = this.cut ? new ReplayQueue(this.bridge) : undefined
+    /** ACP 通知队列（只在有 step 在消费时才被排空）。 */
+    this.queue = new UpdateQueue()
+    /** 用量账本（整轮共享）。 */
+    this.ledger = new UsageLedger()
+    /** 已经作为 `usage` chunk 交出去的量（分步时按增量发，避免重复计入）。 */
+    this.reported = undefined
+    /** `session/prompt` 是否已经结算。 */
+    this.done = false
+    /** 最近一次 `agentPhase`（CodeBuddy 的阶段机；`model_requesting` 意味着后面还有帧）。 */
+    this.phase = undefined
+    this.stopReason = undefined
+    /** @type {unknown} */
+    this.failure = undefined
+    /** 当前 step 是否因为发过工具块而收口。 */
+    this.segmentCut = false
+    /** 这一条 ACP turn 一共开了几个 step。 */
+    this.segments = 0
+    /** 已经交给 DSH 的正文（累积），只用于「有正文」判断。 */
+    this.answerChars = 0
+    /** 已经交给 DSH 的 chunk 数（用来判断「这一轮到底有没有吐出东西」）。 */
+    this.chunks = 0
+    /** 兼容模式暂存的正文（见 {@link TurnEmitter.pushText}）。 */
+    this.heldText = ''
+    /** 首段投喂的签名是否已经记进会话态（`onSettled` 与收尾两条路径共用，避免重复记）。 */
+    this.signed = false
+    /** @type {(() => void) | undefined} */
+    this.unsubscribe = undefined
+    /** @type {(() => void) | undefined} */
+    this.releaseGate = undefined
+    /** @type {(() => void) | undefined} */
+    this.detachAbort = undefined
+    /** @type {NodeJS.Timeout | undefined} */
+    this.cancelTimer = undefined
+    /** 等待「有新帧 / 收口」的唤醒器。 */
+    this.waiters = []
+  }
+
+  /**
+   * 把 ACP 通知接进来。
+   *
+   * 只有**需要按 step 渲染**的帧进队列；用量是会话级的立刻记账，标题立刻转给 DSH，
+   * `agentPhase` 也立刻记下来（它是「后面还有帧」的信号，见 {@link LiveTurn#hasMore}）。
+   */
+  attach() {
+    this.unsubscribe = this.connection.onUpdate(this.sessionId, (update) => {
+      if (update === null || typeof update !== 'object') return
+      if (this.config.logLevel === 'info') {
+        this.logger.info?.(`[acp update] ${String(update.sessionUpdate)} ${JSON.stringify(update).slice(0, 600)}`)
+      }
+      switch (update.sessionUpdate) {
+        case 'usage_update':
+          this.ledger.record(update)
+          return
+        case 'session_info_update': {
+          // 阶段机要**立刻**记：它是「CodeBuddy 还在忙、后面一定还有帧」的确定信号
+          // （实测 `model_requesting` 紧跟工具 `completed` 之后 +2ms），
+          // 回放工具据此判断「该继续下一步」而不用等超时。
+          const phase = update._meta?.['codebuddy.ai/agentPhase']
+          if (typeof phase?.phase === 'string') this.phase = phase.phase
+          const title = typeof update.title === 'string' ? update.title.trim() : ''
+          if (title !== '') this.onTitle?.(title)
+          break
+        }
+        case 'plan':
+          // 待办同步是会话级的，立刻做；播报留在对应 step 里。
+          this.onPlan?.(Array.isArray(update.entries) ? update.entries : [])
+          break
+        case 'current_mode_update':
+          if (this.config.logLevel === 'info') {
+            this.logger.info?.(`[acp update] mode=${String(update.currentModeId)}`)
+          }
+          return
+        default:
+          if (!KNOWN_STEP_UPDATES.has(update.sessionUpdate)) {
+            if (this.config.logLevel === 'info') {
+              this.logger.info?.(`[acp update] ${String(update.sessionUpdate)}`)
+            }
+            return
+          }
+          break
+      }
+      this.queue.push(update)
+      this.#wake()
+    })
+  }
+
+  /**
+   * 建立新的 step 编排器。
+   * @param {(chunk: object) => void} emit chunk 出口。
+   * @returns {TurnEmitter} 编排器。
+   */
+  emitter(emit) {
+    return new TurnEmitter({
+      emit,
+      bridge: this.bridge,
+      tools: this.tools,
+      emitted: this.emitted,
+      ...this.emitterOptions,
+    })
+  }
+
+  /** @returns {boolean} ACP turn 是否已经没有后续内容（收尾窗口也结束了）。 */
+  get finished() {
+    return this.queue.size === 0 && this.queue.closed
+  }
+
+  /** @returns {boolean} 是否还有**会产生可见块**的内容要交给下一个 step。 */
+  get hasMore() {
+    if ((this.tools?.size ?? 0) > 0) return true
+    if (this.heldText !== '') return true
+    // CodeBuddy 正在跑模型请求：后面一定还有帧（实测 `model_requesting` 紧跟工具结算），
+    // 不能因为「队列暂时空着」就判定这一轮没内容了。
+    if (this.phase === 'model_requesting' || this.phase === 'model_streaming') return true
+    return this.queue.items.some((update) => this.#isMoreContent(update))
+  }
+
+  /**
+   * 判断一帧还会不会写出可见块。
+   *
+   * 阶段帧（`session_info_update` 的 `agentPhase`）与计划帧只在兼容模式的文字播报下才有输出；
+   * 回放模式下它们不进队列内容，所以不该被当成「还有后续」——否则会多出一个空 step。
+   *
+   * @param {object} update ACP 更新。
+   * @returns {boolean} 是否可能写出块。
+   */
+  #isMoreContent(update) {
+    switch (update.sessionUpdate) {
+      case 'agent_message_chunk':
+      case 'agent_thought_chunk':
+      case 'tool_call':
+      case 'tool_call_update':
+        return true
+      case 'plan':
+      case 'session_info_update':
+        return this.narration !== 'off' && this.narration !== undefined
+      default:
+        return false
+    }
+  }
+
+  /**
+   * 回放工具用它判断「这一轮是不是还有后续内容」。
+   *
+   * - `more`：还有帧没交出去（或者还有工具没发块），DSH 应当继续下一个 step；
+   * - `done`：这次 ACP turn 已经结束且没有剩余内容，可以 `concludeTurn()`；
+   * - `unknown`：等不到确定答案（超时），保守起见按「还有」处理。
+   *
+   * @param {number} timeoutMs 最多等多久（毫秒）。
+   * @returns {Promise<'more' | 'done' | 'unknown'>} 判断结果。
+   */
+  async whenMore(timeoutMs) {
+    const deadline = Date.now() + Math.max(0, Number.isFinite(timeoutMs) ? timeoutMs : 0)
+    while (true) {
+      if (this.hasMore) return 'more'
+      // 失败了也要让 DSH 再走一步：那一步才会把错误作为 chunk 交给会话，
+      // 在这里收口会让失败被吞掉（用户只看到工具卡片，没有报错）。
+      if (this.failure !== undefined) return 'more'
+      if (this.finished) return 'done'
+      const left = deadline - Date.now()
+      if (left <= 0) return 'unknown'
+      await this.#wait(left)
+    }
+  }
+
+  /**
+   * 计算本 step 应该补发的用量增量。
+   * @returns {object | undefined} 增量用量（没有增长时为 undefined）。
+   */
+  usageDelta() {
+    const { usage } = this.ledger.total()
+    if (usage === undefined) return undefined
+    const previous = this.reported
+    const delta = {
+      inputTokens: usage.inputTokens - (previous?.inputTokens ?? 0),
+      outputTokens: usage.outputTokens - (previous?.outputTokens ?? 0),
+    }
+    for (const key of ['totalTokens', 'reasoningTokens', 'cacheReadTokens', 'cacheWriteTokens']) {
+      const next = usage[key]
+      if (typeof next !== 'number') continue
+      delta[key] = next - (previous?.[key] ?? 0)
+    }
+    this.reported = { ...usage }
+    return delta.inputTokens > 0 || delta.outputTokens > 0 || (delta.totalTokens ?? 0) > 0 ? delta : undefined
+  }
+
+  /** 唤醒所有等待者。 */
+  #wake() {
+    for (const wake of this.waiters.splice(0)) wake()
+  }
+
+  /**
+   * 等一小会儿（有新帧或收口就提前返回）。
+   * @param {number} ms 最长等待毫秒。
+   * @returns {Promise<void>} 完成。
+   */
+  #wait(ms) {
+    return new Promise((resolve) => {
+      // 这里**不能** `unref()`：等待本身就是「有事在做」，unref 之后进程可能在
+      // 定时器触发前就没有其它句柄，await 永远悬着。
+      const timer = setTimeout(() => {
+        const index = this.waiters.indexOf(done)
+        if (index >= 0) this.waiters.splice(index, 1)
+        resolve()
+      }, ms)
+      const done = () => {
+        clearTimeout(timer)
+        resolve()
+      }
+      this.waiters.push(done)
+    })
+  }
+
+  /**
+   * 处理一帧 ACP 更新（在对应 step 的编排器上渲染）。
+   * @param {object} update ACP 更新。
+   * @param {TurnEmitter} emitter 当前 step 的编排器。
+   * @param {string} recordKey DSH 会话键（任务清单同步用）。
+   */
+  apply(update, emitter, recordKey) {
+    switch (update.sessionUpdate) {
+      case 'agent_message_chunk': {
+        const content = update.content
+        if (content?.type === 'text' && typeof content.text === 'string') emitter.pushText(content.text)
+        break
+      }
+      case 'agent_thought_chunk': {
+        const content = update.content
+        if (content?.type === 'text' && typeof content.text === 'string') emitter.pushReasoning(content.text)
+        break
+      }
+      case 'tool_call':
+        emitter.toolCall(update)
+        break
+      case 'tool_call_update':
+        emitter.toolUpdate(update, recordKey)
+        break
+      case 'plan': {
+        // 计划播报只在兼容模式（`toolEmit: 'settle'` 的文字播报）下有意义。
+        if (this.narration === 'off' || this.narration === undefined) break
+        const entries = Array.isArray(update.entries) ? update.entries : []
+        const summary = entries
+          .map((entry) => `${entry?.status === 'completed' ? '✓' : '●'} ${entry?.content ?? ''}`)
+          .join('\n')
+        if (summary !== '') emitter.pushActivity(this.narration === 'text' ? 'text' : 'reasoning', `[计划]\n${summary}\n`)
+        break
+      }
+      case 'session_info_update': {
+        // 阶段机：只把「还没开始输出正文」时的阶段写成一行状态，答案开始后再刷就是噪声。
+        const phase = update._meta?.['codebuddy.ai/agentPhase']
+        if (this.narration !== 'off' && this.narration !== undefined
+          && typeof phase?.phase === 'string' && !emitter.hasAnswerText()) {
+          emitter.phase(phase.phase, phase.toolName, phase.streamingToolName)
+        }
+        break
+      }
+      default:
+        break
+    }
+  }
+
+  /**
+   * 建立一条 ACP prompt（含取消、连接闸门与结算收尾）。
+   *
+   * @param {object[]} promptContent ACP 内容块。
+   * @param {AbortSignal | undefined} signal 这一轮的取消信号。
+   * @param {object} shared 共享连接（取连接级闸门用）。
+   * @returns {Promise<void>} 完成（prompt 已结算或已失败）。
+   */
+  async prompt(promptContent, signal, shared) {
+    const connection = this.connection
+    let abortController
+    if (typeof AbortController === 'function') abortController = new AbortController()
+    const sendCancel = () => {
+      try {
+        connection.cancel(this.sessionId)
+      } catch {
+        // 连接可能已断开。
+      }
+    }
+    const onAbort = () => {
+      sendCancel()
+      if (abortController === undefined) return
+      const grace = this.config.cancelGraceMs
+      if (!(grace > 0)) {
+        abortController.abort()
+        return
+      }
+      this.cancelTimer = setTimeout(() => abortController.abort(), grace)
+      this.cancelTimer.unref?.()
+    }
+    const requestSignal = abortController?.signal ?? signal
+    if (signal?.aborted === true) {
+      sendCancel()
+      abortController?.abort()
+    } else {
+      signal?.addEventListener('abort', onAbort, { once: true })
+    }
+    this.detachAbort = () => {
+      if (this.cancelTimer !== undefined) clearTimeout(this.cancelTimer)
+      signal?.removeEventListener('abort', onAbort)
+    }
+
+    try {
+      this.releaseGate = await shared.acquire()
+    } catch (error) {
+      this.detachAbort()
+      this.unsubscribe?.()
+      this.queue.close()
+      throw error
+    }
+
+    try {
+      const result = await connection.prompt(this.sessionId, promptContent, {
+        signal: requestSignal,
+        timeoutMs: this.config.turnTimeoutMs > 0 ? this.config.turnTimeoutMs : undefined,
+      })
+      this.stopReason = result.stopReason
+      if (result.usage !== undefined) {
+        // PromptResponse 实测不带 usage；这条分支只在未来协议变化时才有意义。
+        this.ledger.record({ _meta: { 'codebuddy.ai/messageId': 'promptResult', usage: result.usage } })
+      }
+    } catch (error) {
+      this.failure = error
+    } finally {
+      this.done = true
+      this.detachAbort?.()
+      // 队列**延迟**关闭：实测 PromptResponse 之后同一会话仍可能继续出帧
+      // （最终正文、标题、用量），一到结算就 close 会把最后那段正文丢掉。
+      this.queue.closeAfter(this.config.settleGraceMs)
+      this.releaseGate?.()
+      this.#wake()
+      // 这一轮可能是在**没有 step 消费**的情况下收口的（例如用户中断后
+      // DSH 不再调 stream）。通知适配器把会话态收拾干净，否则 `record.live`
+      // 会一直挂着、连接闸门也会被一直占着。
+      this.onSettled?.(this)
+      // 订阅等窗口结束再摘：窗口内还要靠它把尾帧送进队列。
+      const unsubscribe = this.unsubscribe
+      this.unsubscribe = undefined
+      const timer = setTimeout(() => unsubscribe?.(), Math.max(0, this.config.settleGraceMs))
+      timer.unref?.()
+    }
+  }
+
+  /** 本地放弃：宿主提前关掉迭代器、或插件卸载时调用。 */
+  cancel() {
+    try {
+      this.connection.cancel(this.sessionId)
+    } catch {
+      // 连接可能已断开。
+    }
+    this.detachAbort?.()
+    this.unsubscribe?.()
+    this.queue.close()
+    this.releaseGate?.()
+    this.done = true
+    this.#wake()
+    this.onSettled?.(this)
+  }
+
+  /**
+   * 记下失败并收口（连接闸门拿不到、prompt 被拒等）。
+   * @param {unknown} error 抛出物。
+   */
+  fail(error) {
+    this.failure = error
+    this.done = true
+    this.detachAbort?.()
+    this.unsubscribe?.()
+    this.queue.close()
+    this.releaseGate?.()
+    this.#wake()
+    this.onSettled?.(this)
+  }
+
+  /**
+   * 收口通知（由适配器注入）：这一轮已经结束，且**没有 step 在消费**时也要把会话态收拾干净。
+   * @param {LiveTurn} live 运行态。
+   */
+  notifySettled(live) {
+    this.onSettled?.(live)
+  }
+}
+
+/**
+ * ACP 通知队列：让 step 之间可以「慢慢消费」，没有 step 在消费时帧就排队。
+ */
+class UpdateQueue {
+  constructor() {
+    /** @type {object[]} */
+    this.items = []
+    /** @type {(() => void)[]} */
+    this.waiters = []
+    this.closed = false
+  }
+
+  /** @returns {number} 待消费帧数。 */
+  get size() {
+    return this.items.length
+  }
+
+  /**
+   * 入队一帧。
+   * @param {object} item ACP 更新。
+   */
+  push(item) {
+    if (this.closed) return
+    this.items.push(item)
+    const waiter = this.waiters.shift()
+    waiter?.()
+  }
+
+  /** 关闭队列（已排队的帧仍可被取走）。 */
+  close() {
+    if (this.closed) return
+    if (this.closeTimer !== undefined) {
+      clearTimeout(this.closeTimer)
+      this.closeTimer = undefined
+    }
+    this.closed = true
+    for (const waiter of this.waiters.splice(0)) waiter()
+  }
+
+  /**
+   * 延迟关闭：给「prompt 已结算、但尾帧还在到达」留一个收尾窗口。
+   *
+   * 实测 CodeBuddy 在 `PromptResponse` 之后同一会话仍可能继续出帧（最终正文、标题、用量）；
+   * 一到结算就 `close()` 会把它们全丢掉，于是最终正文凭空消失。
+   *
+   * @param {number} ms 窗口长度（毫秒）。
+   */
+  closeAfter(ms) {
+    if (this.closed) return
+    // 这里**不能** `unref()`：这个定时器是「收口必须发生」的唯一保证，
+    // unref 后进程可能在窗口结束前就认为没事可做，队列于是永远停在未关闭状态。
+    this.closeTimer = setTimeout(() => this.close(), Math.max(0, ms))
+  }
+
+  /**
+   * 取下一帧；没有就等到有帧或队列关闭。
+   * @returns {Promise<object | undefined>} 下一帧；`undefined` 表示队列已关闭且没有剩余。
+   */
+  async next() {
+    while (this.items.length === 0) {
+      if (this.closed) return undefined
+      await new Promise((resolve) => this.waiters.push(resolve))
+    }
+    return this.items.shift()
+  }
+}
+
+/** 需要按 step 渲染的 ACP 通知（其余是会话级的，见 {@link LiveTurn#attach}）。 */
+const KNOWN_STEP_UPDATES = new Set([
+  'agent_message_chunk',
+  'agent_thought_chunk',
+  'tool_call',
+  'tool_call_update',
+  'plan',
+  'session_info_update',
+])
 
 /**
  * 判断一条工具记录是否「够信息量可以发块」。
@@ -1005,53 +1594,6 @@ export function normalizePolicy(policy) {
     ? policy.defaultModel
     : undefined
   return { enabled, order, ...defaultModel === undefined ? {} : { defaultModel } }
-}
-
-/**
- * 极简异步队列：把事件回调里的 chunk 变成可 `for await` 的序列。
- */
-class ChunkQueue {
-  constructor() {
-    this.items = []
-    this.waiters = []
-    this.ended = false
-  }
-
-  /**
-   * 入队。
-   * @param {object} item chunk。
-   */
-  push(item) {
-    if (this.ended) return
-    const waiter = this.waiters.shift()
-    this.items.push(item)
-    waiter?.(undefined)
-  }
-
-  /** 结束。 */
-  end() {
-    this.ended = true
-    for (const waiter of this.waiters.splice(0)) waiter(undefined)
-  }
-
-  /** @returns {AsyncIterableIterator<object>} 迭代器。 */
-  [Symbol.asyncIterator]() {
-    let closed = false
-    const self = this
-    return {
-      async next() {
-        while (true) {
-          if (self.items.length > 0) return { value: self.items.shift(), done: false }
-          if (self.ended || closed) return { value: undefined, done: true }
-          await new Promise((resolve) => self.waiters.push(() => resolve(undefined)))
-        }
-      },
-      async return() {
-        closed = true
-        return { value: undefined, done: true }
-      },
-    }
-  }
 }
 
 /**
@@ -1528,18 +2070,21 @@ class SessionRecord {
     /** 当前这一轮的取消信号（权限询问要能被中断）。 */
     this.currentSignal = undefined
     /**
-     * 暂存的**最终正文**，等下一个 step 才交给 DSH。
+     * 还在跑的那条 ACP turn（见 {@link LiveTurn}）。
+     *
+     * 分段模式（`toolCut: 'step'`）下，一次 ACP turn 会被切成多个 DSH step：
+     * 每个工具结算后立刻在它自己那一步落地，剩下的帧由下一个 step 接着消费。
+     * 两个 step 之间这条 turn 仍然活着，所以必须挂在会话运行态上。
+     */
+    this.live = undefined
+    /**
+     * 暂存的**最终正文**，等下一个 step 才交给 DSH（只有兼容模式 `toolCut: 'turn'` 会用到）。
      *
      * 为什么不能和工具调用一起发：DSH 的 Chat 只把「最后一个 step 中不含 tool-call 块的
      * assistant 回复」认作最终答案（见 ui-chat 的 `latestAnswer`）。同一个 step 里既有
      * tool-call 块又有正文时，正文会被判定成过程内容，整轮一折叠结论就看不见了。
      *
-     * 所以这一轮只要发生过工具调用，正文就先存在这里；回放工具因为参数里带了
-     * `holdAnswer` 而**不结束本轮**，DSH 于是自然进入下一个 step，那一步只交出这段正文，
-     * 它便落在一个干净的、不含 tool-call 块的消息里，整轮折叠也不会再把它收走。
-     *
-     * 只有「DSH 这次调用没有带新的用户消息」时才会交割（见 {@link CodeBuddyAdapter#run}），
-     * 所以用户中途发新消息不会拿到一句过期的旧结论。
+     * 分段模式没有这个问题：正文天然落在自己那一步里。
      */
     this.heldAnswer = undefined
   }
@@ -1598,10 +2143,17 @@ export class CodeBuddyAdapter {
     this.sessions = new Map()
     /** @type {Map<string, SharedConnection>} */
     this.connections = new Map()
+    /** 正在跑的 ACP turn（跨 step 存活，见 {@link LiveTurn}）。 */
+    this.liveTurns = new Set()
     this.staticCatalog = undefined
     this.staticCatalogAt = 0
     /** 每个 DSH 会话的串行闸门。 */
     this.tails = new Map()
+    // 回放工具要能问「这条调用所属的 ACP turn 还有没有后续内容要交给 DSH」，
+    // 从而决定是继续下一个 step 还是 concludeTurn()。
+    if (typeof this.toolBridge?.setLiveProbe === 'function') {
+      this.toolBridge.setLiveProbe((callId) => this.#liveOfCall(callId))
+    }
   }
 
   /**
@@ -1893,6 +2445,15 @@ export class CodeBuddyAdapter {
    * @returns {Promise<void>} 完成。
    */
   async dispose() {
+    // `cancel()` 会经 `onSettled` 从 `liveTurns` 里摘掉自己，所以先拍快照再遍历。
+    for (const live of [...this.liveTurns]) {
+      try {
+        live.cancel()
+      } catch {
+        // 连接可能已经断开。
+      }
+    }
+    this.liveTurns.clear()
     const connections = [...this.connections.values()]
     this.connections.clear()
     this.sessions.clear()
@@ -2191,7 +2752,36 @@ export class CodeBuddyAdapter {
 
     const plan = this.#plan(record, messages)
     let pending = plan.pending
-    // 上一轮攒下、还没交出去的正文（见 SessionRecord#heldAnswer）：
+
+    // 上一次调用留下了一条 ACP turn：
+    //
+    // - **还在跑**：说明 DSH 是被上一步的回放工具推动着进入下一个 step（分段模式），
+    //   这次调用要接着消费同一条 ACP turn 的剩余帧，不再向 CodeBuddy 发 prompt
+    //   （发也发不进去：它那一轮还没结束）。
+    // - **已经跑完但没被取走**：上一次 cut 之后回放工具判定「没有后续内容」直接
+    //   `concludeTurn()` 结束了那一轮，所以没人回来收尾。这里就地收尾并记签名，
+    //   否则下一轮会被误判成「还在续段」而永远发不出新用户消息。
+    if (record.live !== undefined) {
+      const live = record.live
+      const release = await this.#acquire(sessionKey)
+      try {
+        if (live.finished) {
+          this.#releaseTurn(record, live)
+          if (live.failure === undefined && live.sent !== undefined) {
+            record.signatures = [...record.signatures, ...live.sent.map((message) => signatureOf(message))]
+          }
+          this.#recordContinuation(record, messages)
+          pending = this.#plan(record, messages).pending
+        } else {
+          yield* this.#continueTurn({ record, live, model, effort, messages, signal: options.signal })
+          return
+        }
+      } finally {
+        release()
+      }
+    }
+
+    // 上一轮攒下、还没交出去的正文（见 SessionRecord#heldAnswer；只有兼容模式会用到）：
     // 若这次新增的消息里**没有新的用户输入**（只有上一段留下的 assistant/tool 消息），
     // 说明 DSH 是被回放工具推动着进入下一个 step，正是交割时机；
     // 用户真的发了新消息则丢掉旧结论，免得拿过期内容当回答。
@@ -2397,7 +2987,8 @@ export class CodeBuddyAdapter {
   }
 
   /**
-   * 一轮完整 prompt。
+   * 一轮完整 prompt：开一条 ACP turn，然后按 step 把它消费完。
+   *
    * @param {object} params 参数。
    * @param {SessionRecord} params.record 运行态。
    * @param {string | undefined} params.model 模型。
@@ -2407,7 +2998,7 @@ export class CodeBuddyAdapter {
    * @param {boolean} params.first 是否全量重放。
    * @param {AbortSignal | undefined} params.signal 取消信号。
    * @param {number} [params.attempt] 第几次尝试（0 表示首次；会话失效只重试一次）。
-   * @returns {AsyncGenerator<object>} chunk 序列。
+   * @returns {AsyncGenerator<object>} chunk 序列（**本次 step** 的部分）。
    */
   async *#turn({ record, model, effort, pending, all, first, signal, attempt = 0 }) {
     // 空内容（例如只有工具结果）直接结束，不必白开一条 ACP 会话。
@@ -2456,181 +3047,259 @@ export class CodeBuddyAdapter {
       return
     }
 
-    const queue = new ChunkQueue()
-    const replay = this.config.toolReplay !== false && this.toolBridge?.ready === true
-    const narration = replay ? 'off' : (this.config.toolNarration === 'auto' ? 'reasoning' : this.config.toolNarration)
-    const emitter = new TurnEmitter(queue, {
-      bridge: this.toolBridge,
-      toolName: this.config.toolName,
-      replay,
-      narration,
-      emitOn: this.config.toolEmit,
-      inputLimit: this.config.toolInputLimit,
-      onToolUpdate: (sessionKey, update) => this.#absorbTodos(sessionKey, update),
-    })
-    const ledger = new UsageLedger()
-    let settled = false
+    const live = this.#createLive({ record, connection, sessionId, shared })
+    // 这一轮到底投喂了哪些消息：签名要按它记，而收口可能发生在第 N 个 step 上，
+    // 所以记在 live 上而不是只留在本函数的局部变量里。
+    live.sent = sent
+    record.live = live
+    live.attach()
     // 权限询问要能被这一轮的取消打断。
     record.currentSignal = signal
-    const unsubscribe = connection.onUpdate(sessionId, (update) => {
-      if (update === null || typeof update !== 'object') return
-      if (this.config.logLevel === 'info') {
-        this.logger.info?.(`[acp update] ${String(update.sessionUpdate)} ${JSON.stringify(update).slice(0, 600)}`)
-      }
-      switch (update.sessionUpdate) {
-        case 'agent_message_chunk': {
-          const content = update.content
-          if (content?.type === 'text' && typeof content.text === 'string') emitter.pushText(content.text)
-          break
-        }
-        case 'agent_thought_chunk': {
-          const content = update.content
-          if (content?.type === 'text' && typeof content.text === 'string') emitter.pushReasoning(content.text)
-          break
-        }
-        case 'tool_call':
-          emitter.toolCall(update)
-          break
-        case 'tool_call_update':
-          emitter.toolUpdate(update, record.key)
-          break
-        case 'plan': {
-          const entries = Array.isArray(update.entries) ? update.entries : []
-          // 新：把 CodeBuddy 的计划同步成 DSH 的待办（todo/write），界面直接出待办面板。
-          this.#forwardPlan(record, entries)
-          if (narration === 'off') break
-          const summary = entries
-            .map((entry) => `${entry?.status === 'completed' ? '✓' : '●'} ${entry?.content ?? ''}`)
-            .join('\n')
-          if (summary !== '') emitter.pushActivity(narration === 'text' ? 'text' : 'reasoning', `[计划]\n${summary}\n`)
-          break
-        }
-        case 'usage_update': {
-          // 两种形态：只带 used/size 的是上下文占用；带 _meta.usage 的是**某一轮模型请求**的结算。
-          // 交给账本按 messageId 归并，既避免重复帧翻倍，又不丢多轮请求的用量。
-          ledger.record(update)
-          break
-        }
-        case 'session_info_update': {
-          // 标题：CodeBuddy 会在跑完第一轮后发布自己的会话标题，这里直接接管 DSH 的标题。
-          const title = typeof update.title === 'string' ? update.title.trim() : ''
-          if (title !== '' && record.codeBuddyTitle !== title) {
-            record.codeBuddyTitle = title
-            this.onSessionTitle?.({ sessionId: record.key, title })
-          }
-          // 阶段机：把 CodeBuddy 的 agentPhase 变成一行状态。
-          // 只在「还没有正文」时播报：答案已经开始输出后再刷状态就是纯噪声。
-          const phase = update._meta?.['codebuddy.ai/agentPhase']
-          if (narration !== 'off' && typeof phase?.phase === 'string' && !emitter.hasAnswerText()) {
-            emitter.phase(phase.phase, phase.toolName, phase.streamingToolName)
-          }
-          break
-        }
-        case 'current_mode_update':
-          if (this.config.logLevel === 'info') this.logger.info?.(`[acp update] mode=${String(update.currentModeId)}`)
-          break
-        default:
-          if (this.config.logLevel === 'info') {
-            this.logger.info?.(`[acp update] ${String(update.sessionUpdate)}`)
-          }
-          break
-      }
+    // prompt **不 await**：这一轮会在 cut 处先交回 DSH（此时 ACP 侧还在跑），
+    // 后续由下一个 step 接着消费。请求本身的收口/失败都由 live 自己记，
+    // 所以这里只把异常吞进 live，不让它把当前 step 的 chunk 流打断。
+    void live.prompt(promptContent, signal, shared).catch((error) => {
+      live.fail(error)
     })
 
-    let stopReason
-    let failure
-    let releaseGate
     try {
-      releaseGate = await shared.acquire()
-    } catch (error) {
-      unsubscribe()
-      yield* fail(this.#explain(error))
-      return
-    }
-
-    // 用户中断时必须**先告诉 agent**：只本地放弃请求的话，CodeBuddy 会继续把这一轮
-    // 跑完（继续烧额度），而且在它眼里这条 ACP 会话一直是「忙」的，下一轮可能被拒或串行等待。
-    // ACP 的取消是通知 `session/cancel`，agent 收到后会把 `session/prompt` 结算成
-    // `stopReason: "cancelled"`。所以这里发通知后给一小段宽限期等它体面收尾，
-    // 超时才本地中断（`cancelGraceMs`，0 表示只发通知不等回执）。
-    const abortController = typeof AbortController === 'function' ? new AbortController() : undefined
-    /** @type {NodeJS.Timeout | undefined} */
-    let cancelTimer
-    const sendCancel = () => {
-      try {
-        connection.cancel(sessionId)
-      } catch {
-        // 连接可能已断开。
-      }
-    }
-    const onAbort = () => {
-      sendCancel()
-      if (abortController === undefined) return
-      const grace = this.config.cancelGraceMs
-      if (!(grace > 0)) {
-        abortController.abort()
-        return
-      }
-      cancelTimer = setTimeout(() => abortController.abort(), grace)
-      cancelTimer.unref?.()
-    }
-    const requestSignal = abortController?.signal ?? signal
-    if (signal?.aborted === true) {
-      // 信号在发请求前就已经中断：通知一下 agent，然后立刻本地放弃，没必要等宽限期。
-      sendCancel()
-      abortController?.abort()
-    } else {
-      signal?.addEventListener('abort', onAbort, { once: true })
-    }
-
-    try {
-      const completion = connection
-        .prompt(sessionId, promptContent, {
-          signal: requestSignal,
-          timeoutMs: this.config.turnTimeoutMs > 0 ? this.config.turnTimeoutMs : undefined,
-        })
-        .then((result) => {
-          settled = true
-          stopReason = result.stopReason
-          if (result.usage !== undefined) {
-            // PromptResponse 实测不带 usage；这条分支只在未来协议变化时才有意义。
-            // 用固定键，避免与 usage_update 的 messageId 撞车而重复计数。
-            ledger.record({ _meta: { 'codebuddy.ai/messageId': 'promptResult', usage: result.usage } })
-          }
-        })
-        .catch((error) => {
-          settled = true
-          failure = error
-        })
-        .finally(() => {
-          if (cancelTimer !== undefined) clearTimeout(cancelTimer)
-          signal?.removeEventListener('abort', onAbort)
-          unsubscribe()
-          record.lastUsedAt = Date.now()
-          queue.end()
-        })
-
-      // 先把流式更新边到边发出去，再等 prompt 收口。
-      for await (const chunk of queue) yield chunk
-      await completion
+      yield* this.#steps({
+        record,
+        live,
+        model,
+        effort,
+        all,
+        signal,
+        attempt,
+        firstStep: true,
+      })
     } finally {
-      if (cancelTimer !== undefined) clearTimeout(cancelTimer)
-      signal?.removeEventListener('abort', onAbort)
-      if (!settled) {
-        // 宿主提前关闭迭代器（例如用户中断）：让 CodeBuddy 结束这一轮。
-        try {
-          connection.cancel(sessionId)
-        } catch {
-          // 连接可能已断开。
-        }
-        unsubscribe()
-        queue.end()
-      }
-      releaseGate?.()
       record.currentSignal = undefined
     }
+  }
 
-    const { usage, credits: turnCredits } = ledger.total()
+  /**
+   * 接着消费上一次调用留下的 ACP turn（DSH 被回放工具推动着进入下一个 step）。
+   *
+   * 这里**不向 CodeBuddy 发任何请求**：它那一轮还在跑，剩下的帧只是排队等着被取走。
+   *
+   * @param {object} params 参数。
+   * @param {SessionRecord} params.record 运行态。
+   * @param {LiveTurn} params.live 还在跑的 ACP turn。
+   * @param {string | undefined} params.model 模型。
+   * @param {string | undefined} params.effort 思考档位。
+   * @param {readonly object[]} params.messages 本次请求的完整消息。
+   * @param {AbortSignal | undefined} params.signal 取消信号。
+   * @returns {AsyncGenerator<object>} chunk 序列。
+   */
+  async *#continueTurn({ record, live, model, effort, messages, signal }) {
+    // 进程换了（崩溃重启、空闲回收）：这条 ACP turn 已经不存在，只能按「新一轮」重放历史。
+    if (live.connection !== record.shared?.connection) {
+      this.logger.warn?.('dsh-codebuddy-acp: 续段时发现 CodeBuddy 进程已更换，改为按新一轮处理')
+      live.cancel()
+      record.live = undefined
+      this.#forgetLive(live)
+      const pending = this.#plan(record, messages).pending
+      yield* this.#turn({ record, model, effort, pending, all: messages, first: false, signal })
+      return
+    }
+    record.currentSignal = signal
+    try {
+      yield* this.#steps({
+        record,
+        live,
+        model,
+        effort,
+        all: messages,
+        signal,
+        attempt: 0,
+        firstStep: false,
+      })
+    } finally {
+      record.currentSignal = undefined
+    }
+    // 这条 ACP turn 还没走完（cut 收口）：本次 step 到此为止，剩余内容下次再取。
+    if (record.live !== undefined) return
+    // 收口了：把续段产生的 assistant/tool 消息记进签名，否则下一轮会判成前缀不一致而重放历史。
+    this.#recordContinuation(record, messages)
+    // 用户在轮次中途插话（steer）：上一轮已经结束，这里立刻把新消息投喂进去，
+    // 否则那条用户消息会被 DSH 记进历史却永远没人回答。
+    const pending = this.#plan(record, messages).pending
+    if (pending.some((message) => message?.role === 'user' && hasDeliverable([message]))) {
+      yield* this.#turn({ record, model, effort, pending, all: messages, first: false, signal })
+    }
+  }
+
+  /**
+   * 建一条 ACP turn 的运行态（含连接监听与工具队列）。
+   * @param {object} params 参数。
+   * @param {SessionRecord} params.record 会话运行态。
+   * @param {object} params.connection ACP 连接。
+   * @param {string} params.sessionId ACP 会话 id。
+   * @param {object} params.shared 共享连接。
+   * @returns {LiveTurn} 运行态。
+   */
+  #createLive({ record, connection, sessionId, shared }) {
+    const replay = this.config.toolReplay !== false && this.toolBridge?.ready === true
+    const narration = replay ? 'off' : (this.config.toolNarration === 'auto' ? 'reasoning' : this.config.toolNarration)
+    const live = new LiveTurn({
+      config: this.config,
+      logger: this.logger,
+      connection,
+      sessionId,
+      shared,
+      bridge: this.toolBridge,
+      cut: this.config.toolCut === 'step',
+      emitterOptions: {
+        toolName: this.config.toolName,
+        replay,
+        narration,
+        emitOn: this.config.toolEmit,
+        inputLimit: this.config.toolInputLimit,
+        onToolUpdate: (sessionKey, update) => this.#absorbTodos(sessionKey, update),
+      },
+      onPlan: (entries) => this.#forwardPlan(record, entries),
+      onTitle: (title) => {
+        if (record.codeBuddyTitle === title) return
+        record.codeBuddyTitle = title
+        this.onSessionTitle?.({ sessionId: record.key, title })
+      },
+      // 这一轮在**没有 step 消费**时收口（用户中断后 DSH 不再调 stream、或回放工具
+      // 直接 concludeTurn 结束了那一轮）：把会话态就地收拾干净。
+      onSettled: (settled) => this.#releaseSettled(record, settled),
+    })
+    live.shared = shared
+    this.liveTurns.add(live)
+    return live
+  }
+
+  /**
+   * 收口一条已经结束、但当前没有 step 在消费的 ACP turn。
+   *
+   * 这里只做**幂等**的清理：摘掉会话态与登记表、记下首段投喂的签名。
+   * 续段消息的签名要等下一次 `#run` 拿到完整 messages 才补得全（见 {@link #run}）。
+   *
+   * @param {SessionRecord} record 会话运行态。
+   * @param {LiveTurn} live 运行态。
+   */
+  #releaseSettled(record, live) {
+    if (record.live !== live) {
+      this.#forgetLive(live)
+      return
+    }
+    // 队列里还有没被取走的帧：说明下一个 step 马上会来消费它们（cut 之后 DSH 正在执行
+    // 回放工具）。这时**不能**释放，否则下一次 `#run` 会误判成「新一轮」而重复发 prompt。
+    if (live.queue.size > 0 || (live.tools?.size ?? 0) > 0) return
+    // 失败的一轮不记签名：下一轮会按「前缀对不上」重放完整历史，避免上下文丢失。
+    if (!live.signed && live.failure === undefined && live.sent !== undefined) {
+      record.signatures = [...record.signatures, ...live.sent.map((message) => signatureOf(message))]
+      live.signed = true
+    }
+    this.#releaseTurn(record, live)
+  }
+
+  /**
+   * 把一条已经收口的 ACP turn 从登记表里摘掉。
+   * @param {LiveTurn} live 运行态。
+   */
+  #forgetLive(live) {
+    this.liveTurns.delete(live)
+  }
+
+  /**
+   * 按 `callId` 找还在跑的那条 ACP turn（回放工具用它判断要不要结束本轮）。
+   * @param {string} callId 工具调用 id。
+   * @returns {LiveTurn | undefined} 运行态。
+   */
+  #liveOfCall(callId) {
+    for (const live of this.liveTurns) {
+      if (live.emitted.has(callId)) return live
+    }
+    return undefined
+  }
+
+  /**
+   * 消费一条 ACP turn 的若干段，每段 = DSH 的一个 step。
+   *
+   * 段的边界就是「刚发完一个工具块」：DSH 在这一段结束后立刻执行回放工具，
+   * 卡片当场变成完成态；剩下的帧留在队列里给下一段（同一条 ACP turn，不重新 prompt）。
+   *
+   * @param {object} params 参数。
+   * @returns {AsyncGenerator<object>} chunk 序列。
+   */
+  async *#steps({ record, live, model, effort, all, signal, attempt, firstStep }) {
+    while (true) {
+      const chunks = []
+      const emitter = live.emitter((chunk) => { chunks.push(chunk) })
+      live.segments += 1
+      let cut = false
+      try {
+        while (true) {
+          // 1) 已经结算的工具：立刻发块（发块就意味着本段要收口）。
+          if (emitter.emitReady() > 0) cut = true
+          if (!cut) {
+            const update = await live.queue.next()
+            if (update === undefined) {
+              // ACP turn 已经收口：把残留的已结算工具也在这一段里发掉。
+              if (emitter.emitReady() > 0) cut = true
+              break
+            }
+            live.apply(update, emitter, record.key)
+            if (emitter.emitReady() > 0) cut = true
+          }
+          for (const chunk of chunks.splice(0)) {
+            live.chunks += 1
+            yield chunk
+          }
+          if (cut) break
+          if (signal?.aborted === true) break
+        }
+      } finally {
+        for (const chunk of emitter.close()) chunks.push(chunk)
+        for (const chunk of emitter.summary()) chunks.push(chunk)
+        // 兼容模式（一轮一个 step）：正文和工具块混在一条消息里会被折叠，攒到下一步再交。
+        if (emitter.tools === undefined && emitter.holdsAnswer) {
+          live.heldText = emitter.heldText
+          emitter.heldText = ''
+          emitter.markHeldAnswer()
+        }
+        live.answerChars += emitter.answerChars
+        live.segmentCut = cut
+        for (const chunk of chunks.splice(0)) {
+          live.chunks += 1
+          yield chunk
+        }
+      }
+
+      if (signal?.aborted === true) {
+        this.#releaseTurn(record, live)
+        yield { type: 'finish', reason: mapStopReason(live.stopReason, true) }
+        return
+      }
+      if (cut) {
+        // 还有内容要交给下一个 step：本次 stream 到此为止。
+        // DSH 会执行这一步的 tool-call 块，然后带着工具结果再调一次 stream()。
+        const delta = live.usageDelta()
+        if (delta !== undefined) yield { type: 'usage', usage: delta }
+        yield { type: 'finish', reason: { kind: 'tool-calls' } }
+        return
+      }
+      break
+    }
+
+    yield* this.#settleTurn({ record, live, model, effort, all, signal, attempt, firstStep })
+  }
+
+  /**
+   * 一条 ACP turn 跑完之后的收尾：记账、用量、失败与重试。
+   *
+   * @param {object} params 参数。
+   * @returns {AsyncGenerator<object>} chunk 序列。
+   */
+  async *#settleTurn({ record, live, model, effort, all, signal, attempt, firstStep }) {
+    const { usage, credits: turnCredits } = live.ledger.total()
+    this.#releaseTurn(record, live)
+    record.lastUsedAt = Date.now()
 
     if (this.onUsage !== undefined && (turnCredits > 0 || usage !== undefined)) {
       try {
@@ -2648,31 +3317,22 @@ export class CodeBuddyAdapter {
       }
     }
 
-    if (signal?.aborted !== true && failure === undefined) {
+    const failure = live.failure
+    // 首段投喂过的消息才需要记签名；续段里的 assistant/tool 消息由 {@link #recordContinuation} 记。
+    // `onSettled` 可能已经先记过（那一轮是在没有 step 消费时收口的），所以这里只补没记的部分。
+    const sent = live.sent
+    if (!live.signed && signal?.aborted !== true && failure === undefined && sent !== undefined) {
       record.signatures = [...record.signatures, ...sent.map((message) => signatureOf(message))]
-    }
-
-    // 收口：先把滞留的工具调用发出去，再关掉还开着的块。
-    // 回放模式下不再补「本轮工具调用」摘要——工具已经是原生卡片，各带自己的结果。
-    for (const chunk of emitter.close()) yield chunk
-    for (const chunk of emitter.summary()) yield chunk
-
-    // 正文被整体暂存了（这一轮既有工具调用、正文又全部攒住）：把它留给下一个 step。
-    // 同时给本轮的每条工具记录打上 `holdAnswer`，回放工具据此**不结束本轮**，
-    // DSH 于是自然再走一步来收这段正文（见 {@link #markHeldAnswer}）。
-    if (signal?.aborted !== true && failure === undefined && emitter.holdsAnswer) {
-      record.heldAnswer = emitter.heldText
-      emitter.heldText = ''
-      emitter.markHeldAnswer()
+      live.signed = true
     }
 
     if (signal?.aborted === true) {
-      yield { type: 'finish', reason: mapStopReason(stopReason, true) }
+      yield { type: 'finish', reason: mapStopReason(live.stopReason, true) }
       return
     }
     // 会话在 agent 侧已经不存在（进程被回收/重启、会话被关掉），而这一轮**还没吐出任何块**：
     // 作废会话态，用完整历史在新会话上重放一次。不重试的话，这条 DSH 会话之后每一轮都会失败。
-    if (failure !== undefined && attempt === 0 && isSessionGone(failure) && emitter.nextIndex === 0) {
+    if (failure !== undefined && attempt === 0 && firstStep && isSessionGone(failure) && live.chunks === 0) {
       this.logger.warn?.(`dsh-codebuddy-acp: ACP 会话已失效（${failure instanceof Error ? failure.message : String(failure)}），重开会话并重放历史后重试`)
       record.acpSessionId = undefined
       record.shared = undefined
@@ -2692,22 +3352,66 @@ export class CodeBuddyAdapter {
       return
     }
     if (failure !== undefined) {
-      yield* fail(this.#explain(failure), usage)
+      yield* fail(this.#explain(failure), live.usageDelta())
       return
     }
 
-    // 正文留给下一个 step 时，这一轮**不算**「没有返回正文」：工具卡片本身就是输出，
-    // 结论会在下一个 step 到达。只有既没工具、又没正文（含攒住的正文）才是空响应。
-    if (record.heldAnswer === undefined && !emitter.hasAnswerText() && !emitter.hasToolCalls()) {
+    // 兼容模式把正文攒住了：留到下一个 step 单独交出（工具记录上的 `holdAnswer`
+    // 已经在 #steps 里打好，回放工具据此不结束本轮）。
+    if (signal?.aborted !== true && failure === undefined && live.heldText !== '') {
+      record.heldAnswer = live.heldText
+      live.heldText = ''
+    }
+
+    // 整条 ACP turn 既没工具、又没正文：这才是真的空响应。
+    // （纯工具轮的「结论」就是工具卡片本身；有没有结论由回放工具决定轮次是否继续。）
+    if (live.chunks === 0 && live.answerChars === 0 && live.emitted.size === 0 && record.heldAnswer === undefined) {
       yield* fail(new AcpError(
         'CodeBuddy 这一轮没有返回正文（可能被账号额度或权限策略拦下了；也可以先在终端跑一次 codebuddy 确认登录态）',
         { code: 'EMPTY_RESPONSE' },
-      ), usage)
+      ), live.usageDelta())
       return
     }
 
-    if (usage !== undefined) yield { type: 'usage', usage }
-    yield { type: 'finish', reason: mapStopReason(stopReason, false) }
+    const delta = live.usageDelta()
+    if (delta !== undefined) yield { type: 'usage', usage: delta }
+    yield { type: 'finish', reason: mapStopReason(live.stopReason, false) }
+  }
+
+  /**
+   * 把续段（第 2 个 step 起）产生的 assistant/tool 消息记进签名。
+   *
+   * 这些消息已经出现在 DSH 的历史里，但**没有**再发给 CodeBuddy（它那一轮本就在跑）。
+   * 不记签名的话，下一轮 `#plan` 会认为前缀对不上，从而重放全部历史。
+   *
+   * 遇到用户消息就停：那是中途插话，属于下一轮要投喂的内容，不能算「已发送」。
+   *
+   * @param {SessionRecord} record 运行态。
+   * @param {readonly object[]} messages 本次请求的完整消息。
+   */
+  #recordContinuation(record, messages) {
+    let index = record.signatures.length
+    const appended = []
+    while (index < messages.length && messages[index]?.role !== 'user') {
+      appended.push(signatureOf(messages[index]))
+      index += 1
+    }
+    if (appended.length > 0) record.signatures = [...record.signatures, ...appended]
+  }
+
+  /**
+   * 把一条收口的 ACP turn 从会话态里摘掉，并记下续段新增消息的签名。
+   *
+   * 续段（第 2 个 step 起）里 DSH 会把上一步的 assistant 消息与工具结果塞进历史；
+   * 它们并没有再发给 CodeBuddy，但不记签名的话，下一轮 `#plan` 会认为前缀对不上而重放全部历史。
+   *
+   * @param {SessionRecord} record 运行态。
+   * @param {LiveTurn} live 运行态。
+   */
+  #releaseTurn(record, live) {
+    if (record.live === live) record.live = undefined
+    this.#forgetLive(live)
+    live.unsubscribe?.()
   }
 
   /**

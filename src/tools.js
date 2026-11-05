@@ -20,6 +20,9 @@ import { TOOL_KINDS, TOOL_STATUSES } from './tool-bridge.js'
 /** 结果里展示的输出上限（字符），超出截断；完整输出仍留在会话的工具体里。 */
 const DEFAULT_RESULT_LIMIT = 12000
 
+/** 「这条 ACP turn 还有没有后续内容」的默认等待上限（毫秒）。 */
+const DEFAULT_CONTINUATION_WAIT_MS = 1500
+
 /** 状态 → 结果标记。 */
 const STATUS_MARKS = Object.freeze({
   completed: '✓',
@@ -118,6 +121,10 @@ export function registerReplayTool({ ctx, bridge, config, logger }) {
   const resultLimit = Number.isFinite(config.toolOutputLimit) && config.toolOutputLimit > 0
     ? config.toolOutputLimit
     : DEFAULT_RESULT_LIMIT
+  // 「还有没有后续内容」最多等这么久：等得到就继续下一步，等不到就收口本轮。
+  const continuationWaitMs = Number.isFinite(config.toolCutWaitMs) && config.toolCutWaitMs >= 0
+    ? config.toolCutWaitMs
+    : DEFAULT_CONTINUATION_WAIT_MS
 
   const definition = {
     name: config.toolName,
@@ -144,13 +151,22 @@ export function registerReplayTool({ ctx, bridge, config, logger }) {
     async execute(args, exec) {
       const callId = typeof args?.callId === 'string' && args.callId !== '' ? args.callId : undefined
       const record = callId === undefined ? undefined : bridge.read(callId)
-      // 回放工具本身没有副作用，是否结束本轮只取决于「这一轮还有没有正文要发」：
+      // 回放工具本身没有副作用，是否结束本轮取决于「这条 ACP turn 后面还有没有东西要交」：
       //
-      // - **还有正文待发**（记录上的 `holdAnswer`）：不结束本轮，DSH 会照常进入下一个
-      //   step；那一步只交正文，于是结论落在一个**不含 tool-call 块**的 assistant 消息里，
-      //   Chat 才会把它当最终答案，而不是随整轮折叠一起收起。
-      // - **没有正文**（纯工具轮）：立刻结束本轮，省掉一次多余的模型请求。
-      if (record?.holdAnswer !== true) exec.concludeTurn()
+      // - **还有内容**（`toolCut: 'step'` 下剩下的思考/正文/下一个工具帧）：不结束本轮，
+      //   DSH 会照常进入下一个 step，适配器接着把剩余内容交出来。
+      // - **确认没有了**（`done`：ACP turn 已收口且队列已空）：立刻结束本轮，省掉一次空的 step。
+      // - **不确定**（`unknown`：等超时了）：按「还有」处理——宁可多走一步，也不能把
+      //   CodeBuddy 还在生成的最终正文丢掉。
+      //
+      // 兼容模式（`toolCut: 'turn'`）继续用记录上的 `holdAnswer`：那一轮还有正文攒着，
+      // 要让 DSH 再走一步才收得到。
+      const more = await bridge.continuationOf(callId, continuationWaitMs)
+      if (more === undefined) {
+        if (record?.holdAnswer !== true) exec.concludeTurn()
+      } else if (more === 'done') {
+        exec.concludeTurn()
+      }
       if (record === undefined) {
         logger.warn?.(`dsh-codebuddy-acp: 回放工具没找到 callId=${String(callId)} 的记录（可能已被回收）`)
         return {
